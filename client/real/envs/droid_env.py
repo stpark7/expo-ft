@@ -4,11 +4,11 @@ import cv2
 import numpy as np
 
 from droid.robot_env import RobotEnv
-from client.envs.utils import process_image_for_obs
-from client.real_utils.vis_utils import raw_frame_from_raw_obs, save_episode_video as save_episode_video_to_disk
-from client.real_utils.detector import PickBlocksDetector
-from client.real_utils.detector import LightPlugDetector
-from client.real_utils.detector import success_detector_manual
+from client.common.utils import process_image_for_obs
+from client.real.real_utils.vis_utils import raw_frame_from_raw_obs, save_episode_video as save_episode_video_to_disk
+from client.real.real_utils.detector import PickBlocksDetector
+from client.real.real_utils.detector import LightPlugDetector
+from client.real.real_utils.detector import success_detector_manual
 
     
 class DroidEnv(RobotEnv):

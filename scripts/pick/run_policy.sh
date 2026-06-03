@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-source client/.venv/bin/activate
+source client/real/.venv/bin/activate
 
 python -m client.run_client \
     --server_host=0.0.0.0 \

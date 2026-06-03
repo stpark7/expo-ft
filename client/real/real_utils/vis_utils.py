@@ -6,7 +6,7 @@ import cv2
 import imageio
 import numpy as np
 
-from client.envs.utils import process_image_for_obs
+from client.common.utils import process_image_for_obs
 
 
 def raw_frame_from_raw_obs(raw_obs, side_camera_id, wrist_camera_id):

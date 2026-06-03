@@ -1,0 +1,40 @@
+[project]
+name = "expo-ft-client-sim"
+version = "0.1.0"
+description = "EXPO-FT simulation client (actor): rollout server for RoboCasa365 envs"
+requires-python = ">=3.11"
+dependencies = [
+    "absl-py>=2.0.0",
+    "imageio[ffmpeg]",  # ffmpeg extra needed for MP4 episode recording
+    "ml-collections",
+    "numpy",
+    "openpi-client",
+    "tyro",
+    "websockets~=13.1",  # 14+ tightened handshake strictness; pin to match server side
+    # Simulation backend. robocasa (cloned into ./robocasa365) is built on
+    # robosuite; both are installed editable from the local checkouts below and
+    # pull in their own pins (numpy/mujoco/numba/lerobot/...).
+    "robosuite",
+    "robocasa",
+]
+
+# This directory hosts the sim client deps but is not itself a buildable package —
+# the `client/` Python package is consumed via `python -m client.run_client`
+# from the repo root, with this directory's .venv activated.
+[tool.uv]
+package = false
+# robocasa pins numpy==2.2.5 (its tested version); openpi-client conservatively
+# caps numpy<2.0 (a py37-era bound it doesn't actually need — it only does msgpack
+# serialization + image resize). Force robocasa's numpy and override the stale cap.
+override-dependencies = ["numpy==2.2.5"]
+# lerobot==0.3.3 requires huggingface-hub[cli,hf-transfer], but those extras were
+# removed in hf-hub 1.x (which the resolver otherwise picks), causing warnings.
+# Cap to the 0.x line lerobot was built against, where both extras exist.
+constraint-dependencies = ["huggingface-hub<1.0"]
+
+[tool.uv.sources]
+# Paths are relative to this file (client/sim/). robosuite and robocasa are cloned
+# next to it; openpi-client lives under the OpenPI fork. See README "Clone the forks".
+openpi-client = { path = "../../expo_ft/agents/vla/openpi/packages/openpi-client", editable = true }
+robosuite = { path = "robosuite", editable = true }
+robocasa = { path = "robocasa365", editable = true }  # dist name `robocasa` -> dir `robocasa365`

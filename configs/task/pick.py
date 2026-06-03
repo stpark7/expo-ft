@@ -5,7 +5,7 @@ import numpy as np
 from configs.task import real_base
 
 try:
-    from client.envs.droid_env import PickBlocksEnv
+    from client.real.envs.droid_env import PickBlocksEnv
 except Exception:
     print("Not importing droid env [module]")
 

@@ -9,7 +9,8 @@ paper/
 openpi/
 droid/
 expo_ft/agents/vla/openpi/
-client/droid/
+client/real/droid/
+client/sim/robosuite/
+client/sim/robocasa365/
 assets/
 .venv/
-client/.venv/

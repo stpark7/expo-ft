@@ -59,7 +59,7 @@ def _get_human_override_action(task_config: Optional[Any] = None) -> tuple:
     global _spacemouse_policy
     try:
         if _spacemouse_policy is None:
-            from client.real_utils.spacemouse import SpaceMousePolicy
+            from client.real.real_utils.spacemouse import SpaceMousePolicy
             _spacemouse_policy = SpaceMousePolicy(
                 max_lin_vel=task_config.collect_max_lin_vel,
                 max_rot_vel=task_config.collect_max_rot_vel,

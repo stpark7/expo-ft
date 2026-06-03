@@ -6,10 +6,12 @@ Code for the paper *"EXPO-FT: Sample-Efficient Reinforcement Learning Finetuning
 
 ## Setup
 
-The repo has **two independent Python environments**:
+The repo has **multiple independent Python environments that must never be merged** (their pins conflict):
 
 - **Server (learner)** — `.venv/` at the repo root, managed by `pyproject.toml` + `uv.lock`. Holds the modern jax / openpi / lerobot stack used for RL training.
-- **Client (actor)** — `client/.venv/`, managed by `client/pyproject.toml` + `client/uv.lock`. Holds DROID's older numpy / mujoco / opencv pins for the real-robot SDK.
+- **Client (actor)** — one self-contained venv per environment domain. Pick the one matching your setup; both run the same env-agnostic rollout server (`client/run_client.py`):
+  - **Real robot (DROID)** — `client/real/.venv`, managed by `client/real/pyproject.toml` + `client/real/uv.lock`. Holds DROID's older numpy / mujoco / opencv pins for the real-robot SDK.
+  - **Simulation (RoboCasa365)** — `client/sim/.venv`, managed by `client/sim/pyproject.toml` + `client/sim/uv.lock`. Holds the RoboCasa365 simulation stack (Python 3.11, modern mujoco). RoboCasa365 is built on **robosuite**, which it pulls in as its simulation backend.
 
 Both require **Python 3.11+** and [uv](https://docs.astral.sh/uv/getting-started/installation/):
 
@@ -19,12 +21,27 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 
 ### Clone the forks
 
-EXPO-FT depends on two GitHub forks — a [modified OpenPI](https://github.com/pd-perry/openpi/tree/expo_ft) (used by the server) and a [DROID fork](https://github.com/pd-perry/droid) (used by the client). Clone **both before running `uv sync`** — uv installs them as editable local checkouts (see the `[tool.uv.sources]` blocks in `pyproject.toml` and `client/pyproject.toml`), so `uv sync` fails if they aren't present yet. OpenPI lives under `expo_ft/agents/vla/openpi` (used by both envs); DROID lives under `client/droid` (only the client venv needs it).
+EXPO-FT depends on several GitHub forks, all installed as **editable local checkouts** (see the `[tool.uv.sources]` blocks in each `pyproject.toml`). Clone the ones you need **before running `uv sync`** — uv fails if a referenced checkout is missing. You only need the forks for the environments you actually run (e.g. skip DROID if you only use simulation).
+
+| Fork | Clone into | Used by |
+| --- | --- | --- |
+| [modified OpenPI](https://github.com/pd-perry/openpi/tree/expo_ft) | `expo_ft/agents/vla/openpi` | server **and** every client (provides `openpi-client`) |
+| [DROID](https://github.com/pd-perry/droid) | `client/real/droid` | real-robot client only |
+| RoboCasa365 | `client/sim/robocasa365` | simulation client only |
+| [robosuite](https://github.com/ARISE-Initiative/robosuite) (master) | `client/sim/robosuite` | RoboCasa365's simulation backend (dependency) |
 
 ```bash
 # From the repo root.
+
+# Shared by the server and every client.
 git clone -b expo_ft https://github.com/pd-perry/openpi.git expo_ft/agents/vla/openpi
-git clone https://github.com/pd-perry/droid.git client/droid
+
+# Real-robot client (DROID).
+git clone https://github.com/pd-perry/droid.git client/real/droid
+
+# Simulation client (RoboCasa365) and its robosuite backend (master branch required).
+git clone https://github.com/ARISE-Initiative/robosuite.git client/sim/robosuite
+git clone https://github.com/robocasa/robocasa.git client/sim/robocasa365   # TODO: swap for your robocasa365 fork URL/branch
 ```
 
 ### Server (Learner)
@@ -38,7 +55,11 @@ uv sync
 
 ### Client (Actor)
 
-Installs all client dependencies — including the local `client/droid` checkout (editable) — via uv. The client also installs `openpi-client` from the `expo_ft/agents/vla/openpi` checkout, so that fork must be cloned too (see [Clone the forks](#clone-the-forks)).
+The actor runs the rollout environment plus the env-agnostic WebSocket server (`client/run_client.py`, shared by both clients). Install **only** the client that matches your setup — each lives in its own venv and must never be merged with the other or with the server. Both depend on the `openpi-client` package from the `expo_ft/agents/vla/openpi` checkout, so that fork must be cloned regardless (see [Clone the forks](#clone-the-forks)).
+
+#### Real robot (DROID) — `client/real`
+
+Installs the local `client/real/droid` checkout (editable) + `openpi-client` into `client/real/.venv`.
 
 System prerequisites (install **before** `uv sync`):
 
@@ -49,13 +70,29 @@ Install:
 
 ```bash
 # From the repo root.
-# 1. Install client dependencies into ./client/.venv.
-cd client && uv sync && cd ..
+# 1. Install real-robot client dependencies into ./client/real/.venv.
+cd client/real && uv sync && cd ../..
 
 # 2. (Optional) Install pyzed if you use a ZED camera. Must be a separate step
 #    because the pyzed wheel's numpy>=2.0 metadata over-constrains a binary
 #    that actually works against numpy 1.x, so we bypass uv's resolver.
-bash client/install_pyzed.sh
+bash client/real/install_pyzed.sh
+```
+
+#### Simulation (RoboCasa365) — `client/sim`
+
+Installs the local `client/sim/robocasa365` checkout (editable) — together with its robosuite backend (`client/sim/robosuite`) — plus `openpi-client` into `client/sim/.venv`. No ZED/spacemouse hardware is needed: RoboCasa supplies success and reward through its own task checker, so the sim client uses no vision detector.
+
+```bash
+# From the repo root.
+# 1. Install simulation client dependencies into ./client/sim/.venv.
+cd client/sim && uv sync && cd ../..
+
+# 2. One-time RoboCasa setup + kitchen asset download (~10GB).
+source client/sim/.venv/bin/activate
+python -m robocasa.scripts.setup_macros
+python -m robocasa.scripts.download_kitchen_assets
+deactivate
 ```
 
 ## Overview and Code Structure
@@ -68,10 +105,14 @@ train_pi_robo_async.py          # Server: asynchronous RL finetuning loop (sampl
 eval_droid_policy.py            # Server: standalone policy evaluation
 
 client/
-  run_client.py                 # Client: environment rollout server (WebSocket)
-  collect_data.py               # Client: demonstration data collection (spacemouse)
-  envs/                         # Environment wrappers (DROID real robot)
-  real_utils/                   # Success detectors, spacemouse, visualization
+  run_client.py                 # Client: env-agnostic rollout server (WebSocket), shared by both clients
+  common/                       # Shared helpers (image processing) used by every client env
+  real/                         # Real-robot (DROID) client — own venv + droid fork
+    collect_data.py             #   Demonstration data collection (spacemouse)
+    envs/                       #   Environment wrappers (DROID real robot)
+    real_utils/                 #   Success detectors, spacemouse, visualization
+  sim/                          # Simulation (RoboCasa365) client — own venv + robocasa365 fork (+ robosuite backend)
+    envs/                       #   Environment wrappers (RoboCasa)
 
 configs/
   task/                         # Task configs
@@ -105,13 +146,13 @@ We use a [modified fork of OpenPI](https://github.com/pd-perry/openpi/tree/expo_
 
 ### DROID Setup
 
-We use a [fork of DROID](https://github.com/pd-perry/droid) for real-robot control. Cloned into `./client/droid` and installed editable during the [client setup](#client-actor) step. For software, hardware setup and calibration, see the [DROID documentation](https://droid-dataset.github.io/droid/).
+We use a [fork of DROID](https://github.com/pd-perry/droid) for real-robot control. Cloned into `./client/real/droid` and installed editable during the [real-robot client setup](#real-robot-droid--clientreal) step. For software, hardware setup and calibration, see the [DROID documentation](https://droid-dataset.github.io/droid/).
 
 Configure the hardware-specific values before running the client.
 
 **Client / laptop**
 
-- `client/droid/droid/misc/parameters.py`
+- `client/real/droid/droid/misc/parameters.py`
   - `nuc_ip`
 - `configs/task/real_base.py` and any per-task overrides, e.g. `configs/task/light2.py`
   - `side_camera_id`
@@ -128,9 +169,9 @@ Configure the hardware-specific values before running the client.
 
 ### Training Setup
 
-1. **Environment class** -- Create an environment class for your task in `client/envs/droid_env.py`. We include our pick environment as a reference; modify it to match your task's observation space, action space, and reset behavior.
+1. **Environment class** -- Create an environment class for your task in `client/real/envs/droid_env.py` (or `client/sim/envs/` for a simulation task). We include our pick environment as a reference; modify it to match your task's observation space, action space, and reset behavior.
 2. **Task config** -- Create a task config in `configs/task/` to specify task-specific parameters (bounds, reset joints, language instruction, etc.). See `configs/task/pick.py` for an example.
-3. **Success detector** -- Define a success detector for your task in `client/real_utils/detector.py` and register it in your environment class's `detect()` method.
+3. **Success detector** -- Define a success detector for your task in `client/real/real_utils/detector.py` and register it in your environment class's `detect()` method. (Simulation tasks typically read success/reward straight from the simulator instead.)
 
 ### Running the Experiment
 
@@ -218,7 +259,7 @@ After pretraining, finetune the policy with EXPO-FT. The server and client commu
 **Start the DROID server on the NUC**:
 
 ```bash
-# On the NUC, from the DROID install root (for example client/droid
+# On the NUC, from the DROID install root (for example client/real/droid
 # in this checkout, or the NUC's standalone DROID checkout).
 python scripts/server/run_server.py
 ```

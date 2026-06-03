@@ -9,18 +9,18 @@
 #
 # Prerequisites:
 #   - ZED SDK installed at /usr/local/zed (https://www.stereolabs.com/developers/release/)
-#   - client/.venv already created via `uv sync`
+#   - client/real/.venv already created via `uv sync`
 #
-# Run from the repo root: bash client/install_pyzed.sh
+# Run from the repo root: bash client/real/install_pyzed.sh
 
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-VENV_PY="$REPO_ROOT/client/.venv/bin/python"
+REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+VENV_PY="$REPO_ROOT/client/real/.venv/bin/python"
 ZED_API_SCRIPT="/usr/local/zed/get_python_api.py"
 
 if [[ ! -x "$VENV_PY" ]]; then
-    echo "ERROR: $VENV_PY not found. Run 'cd client && uv sync' first." >&2
+    echo "ERROR: $VENV_PY not found. Run 'cd client/real && uv sync' first." >&2
     exit 1
 fi
 if [[ ! -f "$ZED_API_SCRIPT" ]]; then

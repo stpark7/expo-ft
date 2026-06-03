@@ -5,7 +5,7 @@ import numpy as np
 from configs.task import real_base
 
 try:
-    from client.envs.droid_env import Light2Env
+    from client.real.envs.droid_env import Light2Env
 except Exception:
     print("Not importing droid env [module]")
 

@@ -10,7 +10,7 @@ from absl import app, flags
 from ml_collections import config_flags
 from droid.misc.time import time_ms
 
-from client.real_utils.spacemouse import SpaceMousePolicy
+from client.real.real_utils.spacemouse import SpaceMousePolicy
 from droid.trajectory_utils.trajectory_writer import TrajectoryWriter
 
 FLAGS = flags.FLAGS
