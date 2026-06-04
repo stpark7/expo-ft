@@ -126,9 +126,12 @@ class EnvClient:
         response = self._call_operation("create_env", prepared_request)
         return response["env_id"], response["task_description"]
     
-    def reset(self, env_id: str) -> Tuple[Dict[str, Any], bool]:
-        """Reset a environment."""
-        response = self._call_operation("reset", {"env_id": env_id})
+    def reset(self, env_id: str, seed: int = None) -> Tuple[Dict[str, Any], bool]:
+        """Reset a environment.
+
+        seed가 주어지면 sim이 장면을 결정적으로 재현한다(재현평가용). None이면 무작위.
+        """
+        response = self._call_operation("reset", {"env_id": env_id, "seed": seed})
         observation = response["observation"]
         return observation, response["done"]
     
@@ -184,9 +187,12 @@ class EnvClientWrapper:
                     logging.warning(f"{op_name} recovery failed ({e}); retrying recovery...")
                     time.sleep(10)
     
-    def reset(self):
-        """Reset the environment and return observation."""
-        observation, _ = self._call("reset", lambda: self.client.reset(self.env_id))
+    def reset(self, seed=None):
+        """Reset the environment and return observation.
+
+        seed가 주어지면(sim 재현평가) 동일 seed→동일 장면. None이면 무작위(학습 기본).
+        """
+        observation, _ = self._call("reset", lambda: self.client.reset(self.env_id, seed))
         return observation
     
     def step(self, action):

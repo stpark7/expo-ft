@@ -110,7 +110,8 @@ async def _handle_environment_request(websocket: _server.ServerConnection):
                     if env is None:
                         response = {"status": "error", "message": f"Environment {env_id} not found"}
                     else:
-                        obs = env.reset()
+                        # seed가 실리면(sim 재현평가) 결정적 장면으로 reset; 없으면 None=무작위(학습 기본).
+                        obs = env.reset(seed=request.get("seed"))
                         response = {
                             "status": "success",
                             "observation": obs,

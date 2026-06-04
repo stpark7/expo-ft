@@ -68,7 +68,9 @@ class DroidEnv(RobotEnv):
         self._record_frame_buffer = []
         self._ep_count = 0
 
-    def reset(self):
+    def reset(self, seed=None):
+        # seed는 sim 재현평가용 공통 인자다. 실로봇은 시드로 장면을 결정화할 수
+        # 없으므로 받기만 하고 무시한다(env_client의 reset 시그니처를 sim과 맞추기 위함).
         self._before_reset()
         self._steps_since_reset = 0
         self._raw_frame_buffer = []
