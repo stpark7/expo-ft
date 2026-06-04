@@ -20,6 +20,7 @@ from expo_ft.data.replay_buffer import create_replay_buffer
 from expo_ft.data.batch_processor import BatchProcessor
 from expo_ft.env.env_client import EnvClientWrapper
 from expo_ft.env.droid_utils import process_droid_dataset
+from expo_ft.env.robocasa_utils import process_robocasa_dataset
 from expo_ft.utils.log_utils import EpisodeState, TrainingStats
 from expo_ft.utils.train_utils import get_batch_info, init_logging, init_wandb
 
@@ -122,15 +123,22 @@ def main(_):
     init_wandb(checkpoint_dir_path, resuming, FLAGS.project_name, FLAGS.run_name)
     wandb.config.update(FLAGS.flag_values_dict(), allow_val_change=resuming)
 
-    if FLAGS.config_task.env_type in ('droid', 'sim'):
+    if FLAGS.config_task.env_type == 'droid':
         dataset = process_droid_dataset(
             FLAGS.dataset_path,
             FLAGS.config_task,
             num_data=FLAGS.num_data,
         )
-        example_action = dataset[0]['actions'][np.newaxis]
+    elif FLAGS.config_task.env_type == 'sim':
+        # RoboCasa365 LeRobot 데모 -> arm 7차원 action + 16차원 state transition.
+        dataset = process_robocasa_dataset(
+            FLAGS.dataset_path,
+            FLAGS.config_task,
+            num_data=FLAGS.num_data,
+        )
     else:
         raise ValueError(f"Unsupported dataset type: {FLAGS.config_task.env_type}")
+    example_action = dataset[0]['actions'][np.newaxis]
     
     # Create training environment wrapper directly
     train_env_creation_request = {
