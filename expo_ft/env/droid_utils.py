@@ -12,10 +12,29 @@ def _discover_episode_dirs(base_path):
     return [os.path.join(base_path, d) for d in dirs]
 
 def process_droid_dataset(
-    datapath, 
-    task_config, 
+    datapath,
+    task_config,
     episode_indices = None,
     num_data = None):
+    """오프라인 DROID 데모(HDF5)를 리플레이 버퍼에 넣을 transition 리스트로 펼친다.
+
+    `datapath` 아래의 각 에피소드 디렉터리에서 `traj.hdf5`를 읽어, 한 궤적을
+    타임스텝 단위 transition 딕셔너리들로 분해한다. 팔 액션과 그리퍼 액션은
+    하나의 액션 벡터로 합치고, 데모는 성공 궤적으로 간주해 마지막 스텝에만
+    reward=1, done=1을 부여한다.
+
+    Args:
+        datapath: 에피소드 디렉터리들을 담은 루트 경로. 숫자 이름 디렉터리만
+            에피소드로 인식한다(action_videos, lerobot 등은 무시).
+        task_config: 액션 키 설정. `action_space`(팔)와
+            `gripper_action_space`(그리퍼)를 이어붙여 액션 벡터를 만든다.
+        episode_indices: 사용할 에피소드 인덱스 목록. None이면 전체(또는 num_data).
+        num_data: episode_indices가 None일 때 앞에서부터 사용할 에피소드 수.
+
+    Returns:
+        타임스텝 transition dict의 리스트. 각 dict는 observations, actions,
+        rewards, masks(=1-dones), dones 키를 가진다.
+    """
     ep_dirs = _discover_episode_dirs(datapath)
     if episode_indices is not None:
         ep_dirs = [ep_dirs[i] for i in episode_indices if 0 <= i < len(ep_dirs)]

@@ -8,6 +8,10 @@ Research code for the paper *EXPO-FT: Sample-Efficient Reinforcement Learning Fi
 
 There is no test suite, linter, or CI in this repo. It is run via the shell scripts in `scripts/`, not a package test harness.
 
+## Conventions
+
+- **코드 주석은 한글로 작성한다.** (나중에 영어로 바꿔도 되지만, 우선은 읽기 편하게 한글로.)
+
 ## Environments + forks (critical setup detail)
 
 The repo has **multiple independent `uv` virtualenvs that must never be merged**, because the modern JAX/OpenPI learner stack, DROID's older numpy/mujoco/opencv stack, and the RoboCasa365 sim stack have mutually conflicting pins:

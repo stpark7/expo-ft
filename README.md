@@ -39,9 +39,9 @@ git clone -b expo_ft https://github.com/pd-perry/openpi.git expo_ft/agents/vla/o
 # Real-robot client (DROID).
 git clone https://github.com/pd-perry/droid.git client/real/droid
 
-# Simulation client (RoboCasa365) and its robosuite backend (master branch required).
+# Simulation client (RoboCasa365) and its robosuite backend
 git clone https://github.com/ARISE-Initiative/robosuite.git client/sim/robosuite
-git clone https://github.com/robocasa/robocasa.git client/sim/robocasa365   # TODO: swap for your robocasa365 fork URL/branch
+git clone https://github.com/robocasa/robocasa.git client/sim/robocasa365
 ```
 
 ### Server (Learner)
@@ -95,6 +95,32 @@ python -m robocasa.scripts.download_kitchen_assets
 deactivate
 ```
 
+#### RoboCasa365 pi0.5 checkpoint & demo data
+
+EXPO-FT finetunes *from* the pretrained robocasa365 pi0.5 checkpoint (multitask, human-300) rather than training a policy from scratch — download it before running. The demo data is optional (only needed to seed the offline replay buffer; the normalization stats RL needs already ship inside the checkpoint's `assets/`).
+
+**Checkpoint** (~45 GB) — grabs only the `pi05_pretrain_human300/multitask_learning/75000` subfolder (`params/` + `train_state/` + bundled norm-stats `assets/`) from [`robocasa/robocasa365_checkpoints`](https://huggingface.co/robocasa/robocasa365_checkpoints) into `./checkpoints/robocasa365/` (git-ignored):
+
+```bash
+# Any venv with the `hf` CLI works; the sim venv also has hf_transfer for faster downloads.
+source client/sim/.venv/bin/activate
+HF_HUB_ENABLE_HF_TRANSFER=1 hf download \
+    robocasa/robocasa365_checkpoints \
+    --include "pi05_pretrain_human300/multitask_learning/75000/*" \
+    --local-dir ./checkpoints/robocasa365
+deactivate
+# Lands at: ./checkpoints/robocasa365/pi05_pretrain_human300/multitask_learning/75000/{params,train_state,assets}
+```
+
+**Demo data** (optional) — a helper script downloads it into the repo's `data/` dir (git-ignored), matching the repo's dataset convention. By default it fetches just the target task (both splits) instead of all 300 pretraining tasks:
+
+```bash
+bash scripts/sim/setup_demo_data.sh
+# Lands at: data/robocasa365/v1.0/{pretrain,target}/.../PickPlaceCounterToStove/...
+```
+
+RoboCasa's downloader has no output-dir flag — it reads the save location from `DATASET_BASE_PATH` in `client/sim/robocasa365/robocasa/macros_private.py`. The script sets that to `<repo>/data/robocasa365` for you (idempotent) and then downloads. To grab more / different data (other tasks, splits, or sources such as the full pretraining set or mimicgen), edit the `TASKS` / `SPLITS` / `SOURCE` vars at the top of the script — see the [dataset catalog](https://robocasa.ai/docs/build/html/datasets/using_datasets.html).
+
 ## Overview and Code Structure
 
 The system uses a **server-client architecture**: the **server (learner)** runs RL training with the VLA policy, while the **client (actor)** runs the DROID real-robot rollout environment and communicates over WebSocket.
@@ -108,10 +134,12 @@ client/
   run_client.py                 # Client: env-agnostic rollout server (WebSocket), shared by both clients
   common/                       # Shared helpers (image processing) used by every client env
   real/                         # Real-robot (DROID) client — own venv + droid fork
+    README.md                   #   → Real-robot operation guide (hardware, data collection, run)
     collect_data.py             #   Demonstration data collection (spacemouse)
     envs/                       #   Environment wrappers (DROID real robot)
     real_utils/                 #   Success detectors, spacemouse, visualization
   sim/                          # Simulation (RoboCasa365) client — own venv + robocasa365 fork (+ robosuite backend)
+    README.md                   #   → Simulation operation guide (RoboCasa env, run)
     envs/                       #   Environment wrappers (RoboCasa)
 
 configs/
@@ -120,6 +148,7 @@ configs/
 
 expo_ft/
   agents/
+    README.md                   # → How to add your own algorithm / VLA backend
     alg/                        # RL algorithms (EXPO-FT, BC, base agent)
     vla/                        # VLA wrappers (pi0.5 integration)
   data/                         # Replay buffer, dataset loading, batch processor
@@ -136,68 +165,43 @@ scripts/                        # Shell scripts for launching experiments
 
 ## Use your own algorithm & VLA
 
-You can plug in your own online fine-tuning algorithm by implementing it in `expo_ft/agents/alg`, following the learner API used by the existing agents such as `EXPOLearner` and `BCLearner`. Custom VLA backends can similarly be added in `expo_ft/agents/vla`, following the wrapper API used by the pi0.5 integration. After adding a new algorithm or VLA, expose it through the corresponding config in `configs/model/` so the training scripts can instantiate it.
+EXPO-FT is built around two pluggable layers: the **algorithm** (learner) in `expo_ft/agents/alg/` and the **VLA backend** (policy) in `expo_ft/agents/vla/`. You can swap either without touching the training loop — implement the learner / VLA API, expose it through a `configs/model/` config, and (for a new algorithm) add a `model_cls` branch in the training scripts.
+
+See **[`expo_ft/agents/README.md`](expo_ft/agents/README.md)** for the learner API, the EXPO-FT / BC internals, and step-by-step instructions for adding a new algorithm or VLA.
 
 ## Running Experiments with DROID + pi0.5
+
+The steps below are the **shared, server-side pipeline**: data conversion → SFT → EXPO-FT training → evaluation. The **domain-specific actor operation** — hardware setup, demo collection, success detection, and launching the rollout client — lives in the client READMEs:
+
+- **Real robot (DROID)** → [`client/real/README.md`](client/real/README.md)
+- **Simulation (RoboCasa365)** → [`client/sim/README.md`](client/sim/README.md)
 
 ### OpenPI Setup
 
 We use a [modified fork of OpenPI](https://github.com/pd-perry/openpi/tree/expo_ft) with support for frozen encoder training (for efficient action sampling) and Cartesian action control for DROID. Cloned into `./expo_ft/agents/vla/openpi` and installed editable during the [server setup](#server-learner) step (see [Clone the forks](#clone-the-forks)). The same checkout provides the SFT pretraining scripts wrapped below.
 
-### DROID Setup
+### Task setup
 
-We use a [fork of DROID](https://github.com/pd-perry/droid) for real-robot control. Cloned into `./client/real/droid` and installed editable during the [real-robot client setup](#real-robot-droid--clientreal) step. For software, hardware setup and calibration, see the [DROID documentation](https://droid-dataset.github.io/droid/).
+Three task-specific pieces feed the pipeline; create them once per task (real/sim details are in the client READMEs):
 
-Configure the hardware-specific values before running the client.
+1. **Environment class** — `client/real/envs/droid_env.py` (real) or `client/sim/envs/robocasa_env.py` (sim), matching your task's observation/action space and reset behavior.
+2. **Task config** — `configs/task/<task>.py` (bounds, reset joints, language instruction, camera serials, `control_hz`, `residual_action_xyzg`). See `configs/task/pick.py`.
+3. **Success detector** — real only, in `client/real/real_utils/detector.py`, registered in the env's `detect()`; sim reads success/reward straight from the simulator.
 
-**Client / laptop**
-
-- `client/real/droid/droid/misc/parameters.py`
-  - `nuc_ip`
-- `configs/task/real_base.py` and any per-task overrides, e.g. `configs/task/light2.py`
-  - `side_camera_id`
-  - `wrist_camera_id`
-
-**NUC**
-
-- NUC DROID install: `droid/misc/parameters.py`
-  - `sudo_password`
-  - `robot_type`
-  - `robot_serial_number`
-- NUC DROID/Polymetis hardware config
-  - `robot_ip`
-
-### Training Setup
-
-1. **Environment class** -- Create an environment class for your task in `client/real/envs/droid_env.py` (or `client/sim/envs/` for a simulation task). We include our pick environment as a reference; modify it to match your task's observation space, action space, and reset behavior.
-2. **Task config** -- Create a task config in `configs/task/` to specify task-specific parameters (bounds, reset joints, language instruction, etc.). See `configs/task/pick.py` for an example.
-3. **Success detector** -- Define a success detector for your task in `client/real/real_utils/detector.py` and register it in your environment class's `detect()` method. (Simulation tasks typically read success/reward straight from the simulator instead.)
+> The same `config_task` must be **byte-identical on client and server** — both load it independently, and it defines observation/action shapes and the VLA prompt.
 
 ### Running the Experiment
 
-All commands below use `scripts/${TASK_NAME}/...`; refer to `scripts/pick/` for a complete working example of the task scripts.
+All commands below use `scripts/${TASK_NAME}/...`; refer to `scripts/pick/` for a complete working example of the task scripts. Only `scripts/pick/` is fully wired in this repo — for a new task, copy that directory and update the dataset paths, task config, checkpoint paths, and OpenPI asset IDs.
 
 > **Filesystem note:** The example scripts assume the client and server can see the same repo-relative paths. If they run on different filesystems, collect data on the client/robot machine, then copy or sync the collected `data/...` directory to the server/GPU machine before running conversion, norm stats, SFT, RL training, or evaluation. The `dataset_path`, OpenPI assets, SFT checkpoints, and EXPO-FT checkpoints in the server scripts are server-local paths. The client only needs the robot environment code, task config, and network access to the learner; keep any task config or environment changes synced on both machines.
 
-#### 1. Data Collection
+#### 1. Collect demonstration data
 
-Collect demonstration data using a spacemouse. The NUC must be running the DROID server before starting collection:
+Domain-specific — see the client READMEs:
 
-```bash
-# On the NUC, from the DROID install root 
-python scripts/server/run_server.py
-```
-
-```bash
-# On the client / robot machine.
-bash scripts/${TASK_NAME}/collect_data.sh
-```
-
-Parameters to update in `collect_data.sh`:
-
-- `--save_root` -- output directory for collected episodes
-- `--num_episodes` -- number of demonstrations to collect
-- `--task_config` -- task config for the robot environment
+- **Real robot** — teleoperate with a spacemouse (NUC DROID server must be up): [`client/real/README.md`](client/real/README.md#data-collection-spacemouse).
+- **Simulation** — download RoboCasa demos with the helper script: [demo data in Setup](#robocasa365-pi05-checkpoint--demo-data).
 
 #### 2. Data Conversion
 
@@ -214,8 +218,6 @@ Parameters to update in `convert_data.sh`:
 - `TASK_CONFIG` -- task config used to interpret the raw DROID data
 - `DATA_DIR` -- source directory containing successful demonstrations
 - `REPO_NAME` -- LeRobot dataset repo/id written into the converted dataset
-
-Only `scripts/pick/` is fully wired in this repo. For a new task, copy that script directory and update the dataset paths, task config, checkpoint paths, and OpenPI asset IDs.
 
 #### 3. Policy Pretraining (SFT)
 
@@ -254,28 +256,12 @@ The provided pick script runs about 4000 steps, which was sufficient for all tas
 
 #### 4. EXPO-FT Finetuning
 
-After pretraining, finetune the policy with EXPO-FT. The server and client communicate over WebSocket. The client (rollout server) runs the environment and the server (learner) runs the RL training loop.
+After pretraining, finetune the policy with EXPO-FT. The server (learner) runs the RL training loop and the client (rollout server) runs the environment; they communicate over WebSocket.
 
-**Start the DROID server on the NUC**:
+**Start the rollout client** the way that matches your setup:
 
-```bash
-# On the NUC, from the DROID install root (for example client/real/droid
-# in this checkout, or the NUC's standalone DROID checkout).
-python scripts/server/run_server.py
-```
-
-**Start the client** (on the robot machine):
-
-```bash
-# On the client / robot machine.
-bash scripts/${TASK_NAME}/run_policy.sh
-```
-
-Parameters to update in `run_policy.sh`:
-
-- `--server_host` -- interface the rollout server binds to; `0.0.0.0` accepts remote connections
-- `--server_port` -- rollout server port; keep aligned with the tunnel and learner `client_port`
-- `--config_task_path` -- task config for the rollout environment
+- **Real robot** — start the DROID server on the NUC, then run the client: [`client/real/README.md`](client/real/README.md#run-the-rollout-client).
+- **Simulation** — launch the sim rollout client: [`client/sim/README.md`](client/sim/README.md#run-the-rollout-client).
 
 **If the server and client are on different machines**, set up an SSH reverse tunnel on the client machine so the server can reach it via `localhost`:
 
