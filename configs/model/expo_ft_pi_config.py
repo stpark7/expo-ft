@@ -41,6 +41,9 @@ def get_config():
     config.pi05_assets_dir = ""
     config.pi05_asset_id = ""
     config.actor_success_only = True
+    # True면 pi0.5 base actor를 완전히 freeze하고 critic+residual actor+temperature만 RL로 학습.
+    # (vision encoder만 freeze하는 freeze_pi05_encoder와 달리, action expert까지 모두 동결)
+    config.freeze_pi05_actor = False
     config.use_full_augmentation = True  # False = only crop (no rotate/color jitter)
 
     return config

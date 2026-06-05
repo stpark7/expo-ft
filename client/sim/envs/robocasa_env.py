@@ -209,6 +209,16 @@ class RoboCasaEnv:
         else:                             # warmup 등 12차원: 앞 12 사용, arm은 앞 7
             a12 = a[:ACTION_DIM]
             arm = a12[:_ARM_DIM]
+
+        # 에피소드가 이미 종료된 뒤에도 서버 롤아웃 루프가 reset() 전에 step()을
+        # 한 번 더 호출한다(루프가 매 iteration 시작에서 직전 스텝의 done/reward를
+        # 읽어 terminal transition을 저장하는 off-by-one 구조 때문). 그 호출까지
+        # sim을 진행하면 steps=301/300 같은 가짜 종료 로그와 1프레임짜리 영상이
+        # 생긴다. 이미 done이면 sim을 진행하지 않고 마지막 상태를 유지한 채
+        # action 형태(arm 7차원)만 돌려준다.
+        if self._done:
+            return {"executed_action": arm}
+
         action_dict = convert_action(a12)  # 표준 12차원 -> dict 분리 (env_utils)
         raw, reward, done, _truncated, info = self.gym.step(action_dict)
 

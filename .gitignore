@@ -4,6 +4,7 @@ DROID/
 /data/
 checkpoints/
 logs/
+log/
 runs/
 paper/
 openpi/

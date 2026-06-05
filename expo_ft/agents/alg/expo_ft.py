@@ -204,6 +204,8 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
     freeze_encoder: Optional[bool] = struct.field(pytree_node=False)
     freeze_critic_encoder: bool = struct.field(pytree_node=False)
     actor_success_only: bool = struct.field(pytree_node=False)
+    # True면 pi0.5 base actor 업데이트(update_actor)를 건너뛰어 base 정책을 완전히 동결.
+    freeze_pi05_actor: bool = struct.field(pytree_node=False)
     # critic 관측에 채널방향으로 쌓을 카메라 키들(태스크별; robocasa는 3대).
     critic_camera_keys: Tuple[str, ...] = struct.field(pytree_node=False)
     _infer_cache: Optional[dict] = struct.field(pytree_node=False, default=None)
@@ -264,6 +266,7 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
         default_prompt: Optional[str] = None,
         resize_size: Optional[int] = None,
         actor_success_only: bool = False,
+        freeze_pi05_actor: bool = False,
         use_full_augmentation: bool = True,
         critic_camera_keys: Tuple[str, ...] = DEFAULT_CRITIC_CAMERA_KEYS,
         **kwargs,
@@ -454,6 +457,7 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
             freeze_encoder=freeze_encoder,
             freeze_critic_encoder=freeze_critic_encoder,
             actor_success_only=actor_success_only,
+            freeze_pi05_actor=freeze_pi05_actor,
             critic_camera_keys=tuple(critic_camera_keys),
         )
         if not resume:
@@ -863,22 +867,30 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
 
 
     def update(self, agent, batch: DatasetDict, utd_ratio: int, actor_batch: DatasetDict = None):
-        # Drop stale inference copies before JIT; rebuild after so rollouts use new weights.
+        # `agent`는 self와 동일 객체(agent.update(agent,...)로 호출됨). 예전엔 self와 agent로
+        # train state를 2벌 넘기고 donation도 없어, _update_jit의 입출력(self+agent+출력)이
+        # train state 3벌 ≈37GiB가 되어 단일 32GB GPU에서 buffer assignment가 터졌다.
+        # 이제 self 하나만 넘기고 donate(아래 donate_argnums=(0,))해 입력 train state 버퍼를
+        # 출력으로 in-place 재사용 → 업데이트 I/O를 ~1벌(~13GiB)로 줄인다.
+        # (호환성 위해 agent 인자는 시그니처에 남기되 사용하지 않는다.)
+        # 추론 캐시는 JIT 전에 버리고(아래) 갱신 후 다시 만든다.
         new_agent, info = self.replace(_infer_cache=None)._update_jit(
-            agent.replace(_infer_cache=None), batch, utd_ratio, actor_batch
+            batch, utd_ratio, actor_batch
         )
         return new_agent.cache_infer_params(), info
 
 
-    @partial(jax.jit, static_argnames="utd_ratio")
-    def _update_jit(self, agent, batch: DatasetDict, utd_ratio: int, actor_batch: DatasetDict = None):
+    # donate_argnums=(0,): self(train state)를 donate해 입력 버퍼를 출력 new_agent로
+    # in-place 재사용한다(입출력에 train state 2벌이 잡히지 않게). pi05 train_step도 동일 패턴.
+    @partial(jax.jit, static_argnames="utd_ratio", donate_argnums=(0,))
+    def _update_jit(self, batch: DatasetDict, utd_ratio: int, actor_batch: DatasetDict = None):
         batch = batch.copy()
-        rng, key1 = jax.random.split(agent.rng)
+        rng, key1 = jax.random.split(self.rng)
         rng, key2 = jax.random.split(rng)
         batch["image"] = self.data_augmentation_fn(key1, batch["image"])
         batch["next_image"] = self.data_augmentation_fn(key2, batch["next_image"])
         batch = prepare_critic_batch(batch, self.actor.model_config.action_dim, self.action_dim, self.state_dim, self.action_horizon, self.replan_steps, self.critic_camera_keys)
-        new_agent = agent.replace(rng=rng)
+        new_agent = self.replace(rng=rng)
 
         total_bs = batch["actions"].shape[0]
         assert total_bs % utd_ratio == 0, (
@@ -914,9 +926,13 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
         # Use last minibatch for actor updates
         last_minibatch = jax.tree_util.tree_map(lambda x: x[-1] if x is not None and hasattr(x, "shape") else x, minibatches)
 
-        # When actor_success_only, use the dedicated success-episode batch for
-        # the Pi05 actor update; otherwise use the last critic minibatch.
-        if self.actor_success_only:
+        # freeze_pi05_actor면 pi0.5 base actor는 동결 → update_actor 자체를 건너뛴다.
+        # (critic / residual actor / temperature만 아래에서 계속 학습)
+        # 그 외에는 actor_success_only일 때 성공 에피소드 전용 배치로, 아니면 마지막
+        # critic 미니배치로 pi0.5 base actor를 업데이트.
+        if self.freeze_pi05_actor:
+            actor_info = {}
+        elif self.actor_success_only:
             actor_batch = actor_batch.copy()
             rng, key = jax.random.split(new_agent.rng)
             actor_batch["image"] = self.data_augmentation_fn(key, actor_batch["image"])

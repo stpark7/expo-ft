@@ -44,7 +44,7 @@ def get_config():
     config.camera_height = 256
 
     # 작업별로 episode 상한이 다르므로, 조정이 필요함
-    config.max_steps = 300
+    config.max_steps = 400
 
     config.example_action = np.zeros((1, 12), dtype=np.float64)
     config.control_hz = 20

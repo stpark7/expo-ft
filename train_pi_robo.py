@@ -50,6 +50,13 @@ flags.DEFINE_integer("num_updates", 1, "트리거(에피소드/스텝/배치) 1�
 flags.DEFINE_integer("num_batch", 1, "update_type=batch 일 때 몇 에피소드를 모아 한 번 업데이트할지")
 flags.DEFINE_integer("batch_size", 64, "미니배치 크기 (디바이스 수로 나누어떨어져야 함)")
 flags.DEFINE_integer("max_steps", 100_000, "총 학습 스텝 수")
+# 리플레이 버퍼 capacity를 max_steps에서 분리한다. 0이면 기존 동작(=max_steps)으로 폴백.
+# 버퍼는 np.empty로 capacity만큼 잡고 채워지는 만큼 호스트 RAM이 fault된다. capacity가
+# max_steps(기본 100k)에 묶여 있으면 학습이 길어질수록 온라인 버퍼가 ~58GB까지 자라고,
+# 체크포인트 때 params Orbax 직렬화 호스트 복사본(~13GB)이 얹혀 62GB 머신에서 커널 OOM이 난다.
+# 이 값으로 버퍼를 고정 크기 원형(circular)으로 묶으면 학습 길이와 무관하게 RAM이 bounded.
+# (transition당 ≈0.59MB → 60000이면 ≈35GB. resume 시 저장된 버퍼 크기보다 크게 잡아야 안전.)
+flags.DEFINE_integer("buffer_capacity", 0, "리플레이 버퍼 capacity (0 = max_steps와 동일). 호스트 RAM 상한 제어용")
 flags.DEFINE_integer("num_data", 0, "로드할 오프라인 데모 에피소드 최대 개수 (0 = 전부)")
 flags.DEFINE_boolean("tqdm", True, "tqdm 진행바 사용 여부")
 
@@ -198,10 +205,17 @@ def main(_):
     )
 
     # ── 5. 리플레이 버퍼 2개 (온라인 + 오프라인) ────────────────────────
+    # 버퍼 capacity는 max_steps와 분리(buffer_capacity>0이면 그 값). 학습 길이가 길어도
+    # 호스트 RAM이 bounded가 되도록 고정 크기 원형 버퍼로 묶는다. 0이면 기존대로 max_steps.
+    rb_capacity = FLAGS.buffer_capacity if FLAGS.buffer_capacity > 0 else FLAGS.max_steps
+    logging.info(
+        "Replay buffer capacity = %d (buffer_capacity=%d, max_steps=%d)",
+        rb_capacity, FLAGS.buffer_capacity, FLAGS.max_steps,
+    )
     rb_args = dict(
         config=FLAGS.config,
         example_action=example_action,
-        capacity=FLAGS.max_steps,
+        capacity=rb_capacity,
         task_description=env.task_description,
         replan_steps=FLAGS.replan_steps,
         seed=FLAGS.seed,

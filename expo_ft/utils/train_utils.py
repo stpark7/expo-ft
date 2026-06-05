@@ -107,20 +107,25 @@ def build_pi05_config(config):
 
 
 def _concat_leaves(x, y):
-    """tree_map'd concatenation along axis 0 that tolerates None leaves."""
+    """tree_map'd concatenation along axis 0 that tolerates None leaves.
+
+    numpy(호스트)에서 concat한다. device(jnp) concat은 online+offline 입력 두 개와
+    출력까지 GPU에 동시 상주해 OOM을 유발한다. device 전송은 apply_data_sharding에서.
+    """
     if x is None:
         return y
     if y is None:
         return x
-    return jnp.concatenate([jnp.asarray(x), jnp.asarray(y)], axis=0)
+    return np.concatenate([np.asarray(x), np.asarray(y)], axis=0)
 
 
 def _shuffle_batch(key, batch):
     """Shuffle a (possibly nested) batch along axis=0 with one shared permutation."""
     leaves, treedef = jax.tree_util.tree_flatten(batch)
     n = leaves[0].shape[0]
-    perm = jax.random.permutation(key, n)
-    shuffled = [jnp.asarray(x)[perm] for x in leaves]
+    # perm 인덱스만 jax rng로 뽑고(작은 [n] 배열), 적용은 numpy로 해서 호스트에 둔다.
+    perm = np.asarray(jax.random.permutation(key, n))
+    shuffled = [np.asarray(x)[perm] for x in leaves]
     return jax.tree_util.tree_unflatten(treedef, shuffled)
 
 

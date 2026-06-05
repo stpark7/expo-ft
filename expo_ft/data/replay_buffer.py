@@ -407,20 +407,21 @@ class PiReplayBuffer(Dataset):
 
             _prev_masks = jax_dataset_dict["masks"].copy()
 
-        def to_jax_array(x):
-            """Recursively convert numpy arrays to JAX arrays, handling nested dicts."""
+        # 배치는 호스트(numpy)로 유지한다. 정규화(_convert_to_openpi_format)와
+        # online/offline concat(combine_batches)이 모두 끝난 뒤, apply_data_sharding
+        # 한 곳에서만 device로 올린다. 여기서 jnp으로 올리면 거대 float32 이미지
+        # 중간버퍼와 프리페치 큐(queue_size)가 전부 GPU에 쌓여 OOM이 난다.
+        def to_host_array(x):
+            """Recursively coerce leaves to numpy arrays, handling nested dicts."""
             if isinstance(x, dict):
-                return {k: to_jax_array(v) for k, v in x.items()}
-            elif isinstance(x, (np.ndarray, np.generic)):
-                return jnp.asarray(x)
-            else:
-                try:
-                    return jnp.asarray(x)
-                except (TypeError, ValueError):
-                    return x
-        
-        jax_dataset_dict = to_jax_array(jax_dataset_dict)
-        
+                return {k: to_host_array(v) for k, v in x.items()}
+            try:
+                return np.asarray(x)
+            except (TypeError, ValueError):
+                return x
+
+        jax_dataset_dict = to_host_array(jax_dataset_dict)
+
         return jax_dataset_dict
 
     def _convert_to_openpi_format(self, batch):
