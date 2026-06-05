@@ -225,14 +225,25 @@ def main(_):
     )
 
     # ── 6. 예시 샘플로 실제 action/state 차원 확정 후 에이전트 생성 ─────
-    # 버퍼에서 샘플 하나를 critic 포맷으로 변환해 네트워크 초기화에 쓸 shape를 얻음
-    agent_example_observation, agent_example_state, agent_example_action = offline_replay_buffer.convert_to_critic_format(
-    {
+    # critic이 관측에 쓸 카메라 키들. DROID는 (base, left_wrist) 2대 기본,
+    # robocasa는 task config에서 (base, left_wrist, right_wrist) 3대를 명시.
+    critic_camera_keys = tuple(
+        FLAGS.config_task.get("critic_camera_keys", ("base_0_rgb", "left_wrist_0_rgb"))
+    )
+    # 버퍼에서 샘플 하나를 critic 포맷으로 변환해 네트워크 초기화에 쓸 shape를 얻음.
+    # critic_camera_keys에 right_wrist가 있으면 예시도 3대(9채널)로 만들어 인코더
+    # 입력 채널 수가 그에 맞게 초기화되게 한다.
+    example_inputs = {
         "base_image": offline_replay_buffer.dataset_dict['base_image'][0][np.newaxis],
         "left_wrist_image": offline_replay_buffer.dataset_dict['left_wrist_image'][0][np.newaxis],
         "state": offline_replay_buffer.dataset_dict['state'][0][np.newaxis],
         "actions": offline_replay_buffer.dataset_dict['actions'][0][np.newaxis],
-    })
+    }
+    if "right_wrist_0_rgb" in critic_camera_keys:
+        example_inputs["right_wrist_image"] = offline_replay_buffer.dataset_dict['right_wrist_image'][0][np.newaxis]
+    agent_example_observation, agent_example_state, agent_example_action = offline_replay_buffer.convert_to_critic_format(
+        example_inputs
+    )
     actor.action_dim = agent_example_action.squeeze().shape[-1]
     actor.state_dim = agent_example_state.squeeze().shape[-1]
     # arm(action_dim)을 모델 32차원의 어디에 놓을지(=offset). 현재 모든 태스크 0(arm-first).
@@ -254,6 +265,7 @@ def main(_):
         replan_steps=FLAGS.replan_steps,
         default_prompt=env.task_description,
         residual_action_xyzg=FLAGS.config_task.residual_action_xyzg,
+        critic_camera_keys=critic_camera_keys,
     )
     
     # ── 7. resume 시 체크포인트에서 에이전트 & 버퍼 복원 ────────────────

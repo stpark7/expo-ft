@@ -51,6 +51,11 @@ def get_config():
     # position + gripper만 수정대상으로 학습
     config.residual_action_xyzg = True
 
+    # critic 관측에 쌓을 카메라들. robocasa는 3인칭 2대(agentview_left/right) +
+    # 손목 1대 = 3대가 모두 실제 영상이므로 critic도 9채널(3대)로 본다.
+    # (DROID는 right_wrist가 zeros 더미라 기본 2대만 쓴다.)
+    config.critic_camera_keys = ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb")
+
     # 모델 32차원 action 레이아웃에서 arm(7차원)이 시작하는 위치.
     # ⚠️ robocasa365 체크포인트는 groot 로더(groot_openpi_dataset.py)가 학습 직전
     # action을 ARM-FIRST [eef_pos(0:3), eef_rot(3:6), gripper(6:7), base(7:11),

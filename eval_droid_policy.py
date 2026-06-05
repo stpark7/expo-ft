@@ -172,13 +172,23 @@ def main(_):
     )
     replay_buffer.insert_dataset(dataset[:1])
 
+    # critic이 관측에 쓸 카메라 키들(robocasa는 3대). 학습 때와 동일해야 체크포인트
+    # critic 인코더의 입력 채널 수가 맞는다.
+    critic_camera_keys = tuple(
+        config_task.get("critic_camera_keys", ("base_0_rgb", "left_wrist_0_rgb"))
+    )
     # 데모 첫 transition을 critic 입력 포맷으로 변환해 example shape를 얻는다.
-    agent_example_observation, agent_example_state, agent_example_action = replay_buffer.convert_to_critic_format({
+    example_inputs = {
         "base_image": replay_buffer.dataset_dict["base_image"][0][np.newaxis],
         "left_wrist_image": replay_buffer.dataset_dict["left_wrist_image"][0][np.newaxis],
         "state": replay_buffer.dataset_dict["state"][0][np.newaxis],
         "actions": replay_buffer.dataset_dict["actions"][0][np.newaxis],
-    })
+    }
+    if "right_wrist_0_rgb" in critic_camera_keys:
+        example_inputs["right_wrist_image"] = replay_buffer.dataset_dict["right_wrist_image"][0][np.newaxis]
+    agent_example_observation, agent_example_state, agent_example_action = replay_buffer.convert_to_critic_format(
+        example_inputs
+    )
     # actor의 action/state 차원을 '데이터에서 도출한' 실제 폭으로 확정(체크포인트와 일치해야 함).
     actor.action_dim = agent_example_action.squeeze().shape[-1]
     actor.state_dim = agent_example_state.squeeze().shape[-1]
@@ -202,6 +212,7 @@ def main(_):
         replan_steps=FLAGS.replan_steps,
         default_prompt=task_description,
         residual_action_xyzg=config_task.residual_action_xyzg,
+        critic_camera_keys=critic_camera_keys,
     )
 
     # step!=0 일 때만 실제 학습 가중치를 복원(0이면 빌드된 초기 가중치 그대로 평가).

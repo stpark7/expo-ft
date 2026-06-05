@@ -177,8 +177,17 @@ class PiReplayBuffer(Dataset):
     def convert_to_critic_format(
         self, data_dict: DatasetDict
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Build example critic inputs for agent init (not used for training batches)."""
-        critic_obs = np.concatenate([data_dict["base_image"], data_dict["left_wrist_image"]], axis=-1)
+        """Build example critic inputs for agent init (not used for training batches).
+
+        data_dict에 들어 있는 카메라만 표준 순서(base, left_wrist, right_wrist)로
+        채널방향 concat한다. 호출자가 right_wrist_image를 넣으면 9채널(3대),
+        넣지 않으면 6채널(2대) 예시가 만들어지고 critic 인코더의 입력 채널 수가
+        그에 맞춰 초기화된다. critic_camera_keys와 일관되게 호출해야 한다.
+        """
+        _CRITIC_IMAGE_KEYS = ("base_image", "left_wrist_image", "right_wrist_image")
+        critic_obs = np.concatenate(
+            [data_dict[k] for k in _CRITIC_IMAGE_KEYS if k in data_dict], axis=-1
+        )
         # keep state same as raw state (with padding) 
         critic_state = data_dict["state"] 
         if "actions" in data_dict:

@@ -17,7 +17,7 @@ from flax.training.train_state import TrainState
 import numpy as np
 
 from expo_ft.agents.alg.agent import AgentLearner, initialize_checkpoint_dir
-from expo_ft.agents.alg.batch_utils import prepare_critic_batch, prepare_actor_sampling_batch, extract_critic_fields
+from expo_ft.agents.alg.batch_utils import prepare_critic_batch, prepare_actor_sampling_batch, extract_critic_fields, DEFAULT_CRITIC_CAMERA_KEYS
 from expo_ft.networks.temperature import Temperature
 from expo_ft.data.dataset import DatasetDict
 from expo_ft.distributions import TanhNormal
@@ -122,7 +122,8 @@ def save_checkpoint(
 def load_agent(seed, example_observation, example_action, example_state,
                actor, actor_train_state, target_actor_params, agent_kwargs, metadata,
                mesh, data_sharding, replicated_sharding, resume, replan_steps,
-               default_prompt, residual_action_xyzg):
+               default_prompt, residual_action_xyzg,
+               critic_camera_keys=DEFAULT_CRITIC_CAMERA_KEYS):
     """Create an EXPOLearner from a pre-built VLA actor and remaining config kwargs."""
     agent_kwargs.update(
         actor=actor,
@@ -135,6 +136,7 @@ def load_agent(seed, example_observation, example_action, example_state,
         replicated_sharding=replicated_sharding,
         default_prompt=default_prompt,
         residual_action_xyzg=residual_action_xyzg,
+        critic_camera_keys=tuple(critic_camera_keys),
         **metadata,
     )
     return EXPOLearner.create(seed, example_observation, example_action, example_state, **agent_kwargs)
@@ -202,6 +204,8 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
     freeze_encoder: Optional[bool] = struct.field(pytree_node=False)
     freeze_critic_encoder: bool = struct.field(pytree_node=False)
     actor_success_only: bool = struct.field(pytree_node=False)
+    # critic 관측에 채널방향으로 쌓을 카메라 키들(태스크별; robocasa는 3대).
+    critic_camera_keys: Tuple[str, ...] = struct.field(pytree_node=False)
     _infer_cache: Optional[dict] = struct.field(pytree_node=False, default=None)
 
     @classmethod
@@ -261,6 +265,7 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
         resize_size: Optional[int] = None,
         actor_success_only: bool = False,
         use_full_augmentation: bool = True,
+        critic_camera_keys: Tuple[str, ...] = DEFAULT_CRITIC_CAMERA_KEYS,
         **kwargs,
     ):
         action_dim = action_space.shape[-1]
@@ -449,6 +454,7 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
             freeze_encoder=freeze_encoder,
             freeze_critic_encoder=freeze_critic_encoder,
             actor_success_only=actor_success_only,
+            critic_camera_keys=tuple(critic_camera_keys),
         )
         if not resume:
             agent = agent.cache_infer_params()
@@ -519,7 +525,7 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
         _target_critic_params = c.get("target_critic_params") or jax.device_put(self.target_critic.params, infer_sharding)
 
         transformed_inputs = self.actor.process_raw_inputs(observations, self.action_dim, self.resize_size)
-        transformed_inputs = extract_critic_fields(transformed_inputs, self.actor.model_config.action_dim, self.state_dim)
+        transformed_inputs = extract_critic_fields(transformed_inputs, self.actor.model_config.action_dim, self.state_dim, self.critic_camera_keys)
 
         key, rng = jax.random.split(rng)
         transformed_actions, sample_time = self.actor.sample_actions(
@@ -871,7 +877,7 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
         rng, key2 = jax.random.split(rng)
         batch["image"] = self.data_augmentation_fn(key1, batch["image"])
         batch["next_image"] = self.data_augmentation_fn(key2, batch["next_image"])
-        batch = prepare_critic_batch(batch, self.actor.model_config.action_dim, self.action_dim, self.state_dim, self.action_horizon, self.replan_steps)
+        batch = prepare_critic_batch(batch, self.actor.model_config.action_dim, self.action_dim, self.state_dim, self.action_horizon, self.replan_steps, self.critic_camera_keys)
         new_agent = agent.replace(rng=rng)
 
         total_bs = batch["actions"].shape[0]
@@ -915,7 +921,7 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
             rng, key = jax.random.split(new_agent.rng)
             actor_batch["image"] = self.data_augmentation_fn(key, actor_batch["image"])
             new_agent = new_agent.replace(rng=rng)
-            actor_batch = prepare_critic_batch(actor_batch, self.actor.model_config.action_dim, self.action_dim, self.state_dim, self.action_horizon, self.replan_steps)
+            actor_batch = prepare_critic_batch(actor_batch, self.actor.model_config.action_dim, self.action_dim, self.state_dim, self.action_horizon, self.replan_steps, self.critic_camera_keys)
             new_agent, actor_info = new_agent.update_actor(actor_batch)
         else:
             new_agent, actor_info = new_agent.update_actor(last_minibatch)
