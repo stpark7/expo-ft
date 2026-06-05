@@ -51,4 +51,12 @@ def get_config():
     # position + gripper만 수정대상으로 학습
     config.residual_action_xyzg = True
 
+    # 모델 32차원 action 레이아웃에서 arm(7차원)이 시작하는 위치.
+    # ⚠️ robocasa365 체크포인트는 groot 로더(groot_openpi_dataset.py)가 학습 직전
+    # action을 ARM-FIRST [eef_pos(0:3), eef_rot(3:6), gripper(6:7), base(7:11),
+    # mode(11:12)]로 재배열해 학습했다(=convert_action 순서, norm_stats로 검증됨).
+    # 따라서 arm은 모델 [0:7]에 있으므로 offset=0. (LeRobot 데모의 *컬럼* 순서는
+    # base-first라 모순처럼 보이지만, 학습 로더가 재배열하므로 체크포인트는 arm-first다.)
+    config.action_pad_offset = 0
+
     return config

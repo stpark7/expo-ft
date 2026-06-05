@@ -15,9 +15,14 @@ import os
 import numpy as np
 from tqdm import tqdm
 
-# LeRobot 원본 action(12) 레이아웃(meta/modality.json 기준):
-#   base_motion[0:4] · control_mode[4:5] · eef_pos[5:8] · eef_rot[8:11] · gripper[11:12]
-# 학습기 7차원 = arm = action[5:12] (eef_pos3 + eef_rot3 + gripper1).
+# LeRobot parquet의 *컬럼* 레이아웃은 base-first(meta/modality.json 기준):
+#   action : base_motion[0:4] · control_mode[4:5] · eef_pos[5:8] · eef_rot[8:11] · gripper[11:12]
+#   state  : base_pos[0:3] · base_rot[3:7] · eef_pos_rel[7:10] · eef_rot_rel[10:14] · gripper[14:16]
+# ⚠️ 그러나 체크포인트는 groot 로더가 학습 직전 ARM-FIRST(eef-first)로 재배열한 형태로
+# 학습됐다(norm_stats로 검증). 따라서 여기서 action은 arm 구간 [5:12]만 떼면
+# 그 자체가 arm-first 내부순서 [eef_pos3, eef_rot3, gripper1]가 되어 OK지만,
+# state(16차원 전체)는 base-first→arm-first로 재배열해야 한다(아래 process_robocasa_dataset).
+# 학습기 7차원 = arm = parquet action[5:12] (eef_pos3 + eef_rot3 + gripper1).
 _ROBOCASA_ARM_SLICE = slice(5, 12)
 
 # robocasa_env._CAMERA_MAP와 동일(LeRobot 카메라 키 -> observation/* 규약).
@@ -53,7 +58,8 @@ def process_robocasa_dataset(
     핵심 변환:
       * action : LeRobot 12차원에서 arm 7차원(action[5:12]=eef_pos·eef_rot·gripper)만
                  추출 -> 학습기 action_dim=7. base_motion·control_mode는 드롭.
-      * state  : observation.state(16,) 그대로(modality.json 순서 = env _STATE_ORDER).
+      * state  : observation.state(16,)를 base-first→arm-first(eef-first)로 재배열
+                 (env _STATE_ORDER와 동일; 체크포인트 학습 순서에 맞춤).
       * images : 3개 mp4 디코딩 -> observation/image(agentview_left)·
                  wrist_image(eye_in_hand)·right_image(agentview_right), uint8 (H,W,3).
       * reward/done : parquet next.reward / next.done 그대로(온라인 env reward와 일관).
@@ -108,8 +114,18 @@ def process_robocasa_dataset(
         df = pd.read_parquet(pq)
         T = len(df)
 
-        actions = np.stack(df["action"].to_numpy())[:, _ROBOCASA_ARM_SLICE].astype(np.float32)  # (T,7)
-        states = np.stack(df["observation.state"].to_numpy()).astype(np.float32)                 # (T,16)
+        actions = np.stack(df["action"].to_numpy())[:, _ROBOCASA_ARM_SLICE].astype(np.float32)  # (T,7) arm-first
+        # parquet observation.state는 base-first. 체크포인트가 기대하는 arm-first(eef-first)로
+        # 재배열한다(robocasa_env._STATE_ORDER와 byte 동일해야 함).
+        states_raw = np.stack(df["observation.state"].to_numpy()).astype(np.float32)             # (T,16) base-first
+        states = np.concatenate(
+            [states_raw[:, 7:10],    # eef_pos_rel
+             states_raw[:, 10:14],   # eef_rot_rel
+             states_raw[:, 0:3],     # base_pos
+             states_raw[:, 3:7],     # base_rot
+             states_raw[:, 14:16]],  # gripper_qpos
+            axis=1,
+        )                                                                                        # (T,16) arm-first
         rewards = df["next.reward"].to_numpy().astype(np.float32)                                 # (T,)
         dones = df["next.done"].to_numpy().astype(np.float32)                                     # (T,)
         masks = (1.0 - dones).astype(np.float32)                                                  # (T,)

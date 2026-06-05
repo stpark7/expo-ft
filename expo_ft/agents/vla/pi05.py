@@ -275,10 +275,17 @@ class Pi05Agent(Model):
         infer_device: Optional[jax.Device] = None,
         action_dim: Optional[int] = None,
         state_dim: Optional[int] = None,
+        action_pad_offset: int = 0,
     ):
 
         self.action_dim = action_dim
         self.state_dim = state_dim
+        # 환경 action(action_dim차원)을 모델의 32차원 레이아웃 중 어디에 놓을지의 시작 위치.
+        # DROID·RoboCasa 모두 체크포인트가 arm-first(arm@[0:7])로 학습돼 offset=0이다.
+        # (RoboCasa365 ckpt는 groot 로더가 학습 직전 action을 arm-first로 재배열했다 —
+        #  parquet 컬럼순 [base(0:4),mode(4:5),arm(5:12)]과 헷갈리지 말 것. norm_stats로 검증.)
+        # offset 자체는 일반화를 위한 파라미터이며 configs/task/*.py의 action_pad_offset에서 주입.
+        self.action_pad_offset = action_pad_offset
         self.train_config = train_config
         self.data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
         self.model_config = train_config.model
@@ -425,20 +432,31 @@ class Pi05Agent(Model):
         return (obs, actions)
 
     def _unpad_actions(self, actions):
-        """Reshape padded model actions to (batch, horizon, env action_dim)."""
+        """Reshape padded model actions to (batch, horizon, env action_dim).
+
+        모델의 32차원 출력에서 환경 action이 위치한 구간 [off : off+action_dim]을 떼어낸다.
+        off=action_pad_offset (현재 DROID·RoboCasa 모두 0; arm-first 체크포인트).
+        """
         padded_dim = self.model_config.action_dim
         action_horizon = self.model_config.action_horizon
+        off = self.action_pad_offset
         actions = actions.reshape(actions.shape[0], action_horizon, padded_dim)
-        return actions[..., :self.action_dim]
+        return actions[..., off:off + self.action_dim]
 
     def _pad_actions(self, actions):
-        """Zero-pad env actions to the model's expected action dimension."""
+        """Zero-pad env actions to the model's expected action dimension.
+
+        환경 action(action_dim차원)을 모델 32차원 레이아웃의 [off : off+action_dim]에 놓고
+        앞뒤를 0으로 채운다. off=action_pad_offset (현재 DROID·RoboCasa 모두 0; arm-first 체크포인트).
+        """
         padded_dim = self.model_config.action_dim
         action_horizon = self.model_config.action_horizon
+        off = self.action_pad_offset
         actions = actions.reshape(actions.shape[0], action_horizon, self.action_dim)
         return jnp.concatenate([
+            jnp.zeros((actions.shape[0], action_horizon, off)),
             actions,
-            jnp.zeros((actions.shape[0], action_horizon, padded_dim - self.action_dim))
+            jnp.zeros((actions.shape[0], action_horizon, padded_dim - off - self.action_dim))
         ], axis=-1)
 
     def sample_actions(

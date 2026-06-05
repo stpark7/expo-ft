@@ -20,11 +20,11 @@ observation/* 규약으로 다시 매핑한다.
       observation/state        float32 (16,)  아래 _STATE_ORDER 참고
       prompt                   str            에피소드별 언어 지시문
 
-* observation/state의 concat 순서는
-  robocasa/models/assets/groot_dataset_assets/PandaOmron_modality.json이
-  기준(ground truth)이다:
-  base_position(3) · base_rotation(4) · eef_pos_relative(3) · eef_rot_relative(4)
-  · gripper_qpos(2) = 16.  (PandaOmronKeyConverter.map_obs 딕셔너리 순서가 아님.)
+* observation/state의 concat 순서는 체크포인트를 학습시킨 groot 로더
+  (groot_openpi_dataset.py __getitem__)의 ARM-FIRST(eef-first) concat 순서가
+  기준(ground truth)이다 (modality.json의 base-first 컬럼순이 아님 — 학습 로더가 재배열함):
+  eef_pos_relative(3) · eef_rot_relative(4) · base_position(3) · base_rotation(4)
+  · gripper_qpos(2) = 16.  자세한 근거는 아래 _STATE_ORDER 주석 참고.
 
 * Action은 평탄한 12차원 벡터이며, env_utils.convert_action이 이를
   RoboCasaGymEnv.step이 기대하는
@@ -48,14 +48,19 @@ from robocasa.utils.env_utils import convert_action
 
 logger = logging.getLogger(__name__)
 
-# observation/state 조립 순서의 기준(ground truth, PandaOmron_modality.json).
-# 각 항목은 RoboCasaGymEnv.get_observation이 내보내는 키다
-# (PandaOmronKeyConverter가 proprio 키 앞에 "state." 접두사를 붙인다).
+# observation/state 조립 순서.
+# ⚠️ 기준은 modality.json의 *컬럼* 순서(base-first)가 아니라, 체크포인트를 학습시킨
+# groot 로더(groot_openpi_dataset.py __getitem__)의 concat 순서다. 이 로더는 학습 직전
+# state를 ARM-FIRST(eef-first)로 재배열한다:
+#   eef_pos_rel(0:3) · eef_rot_rel(3:7) · base_pos(7:10) · base_rot(10:14) · gripper(14:16)
+# norm_stats의 지문(std=0 dim이 [10,11]=base_rot, 큰 std가 [7,8]=base_pos)으로 검증됨.
+# 예전 base-first 순서는 eef 차원을 base 통계(std=0)로 정규화해 proprio 토큰을 1e6배로
+# 폭주시켜 pretrained 정책을 step0부터 망가뜨렸다. 이 순서는 offline 로더와 byte 동일해야 한다.
 _STATE_ORDER = (
-    "state.base_position",                  # robot0_base_pos          (3)
-    "state.base_rotation",                  # robot0_base_quat         (4)
     "state.end_effector_position_relative", # robot0_base_to_eef_pos   (3)
     "state.end_effector_rotation_relative", # robot0_base_to_eef_quat  (4)
+    "state.base_position",                  # robot0_base_pos          (3)
+    "state.base_rotation",                  # robot0_base_quat         (4)
     "state.gripper_qpos",                   # robot0_gripper_qpos      (2)
 )
 _STATE_DIM = 16

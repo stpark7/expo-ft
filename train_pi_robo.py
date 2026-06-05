@@ -235,6 +235,8 @@ def main(_):
     })
     actor.action_dim = agent_example_action.squeeze().shape[-1]
     actor.state_dim = agent_example_state.squeeze().shape[-1]
+    # arm(action_dim)을 모델 32차원의 어디에 놓을지(=offset). 현재 모든 태스크 0(arm-first).
+    actor.action_pad_offset = FLAGS.config_task.get("action_pad_offset", 0)
     agent = load_agent(
         seed=FLAGS.seed,
         example_observation=agent_example_observation.squeeze(),

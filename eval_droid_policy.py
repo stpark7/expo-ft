@@ -182,6 +182,8 @@ def main(_):
     # actor의 action/state 차원을 '데이터에서 도출한' 실제 폭으로 확정(체크포인트와 일치해야 함).
     actor.action_dim = agent_example_action.squeeze().shape[-1]
     actor.state_dim = agent_example_state.squeeze().shape[-1]
+    # arm(action_dim)을 모델 32차원의 어디에 놓을지(=offset). 현재 모든 태스크 0(arm-first).
+    actor.action_pad_offset = config_task.get("action_pad_offset", 0)
     # ── 6. agent 조립 → 체크포인트 복원 → 추론 파라미터 캐싱 ───────────────
     agent = load_agent(
         seed=FLAGS.seed,
