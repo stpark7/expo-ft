@@ -874,9 +874,25 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
         # 출력으로 in-place 재사용 → 업데이트 I/O를 ~1벌(~13GiB)로 줄인다.
         # (호환성 위해 agent 인자는 시그니처에 남기되 사용하지 않는다.)
         # 추론 캐시는 JIT 전에 버리고(아래) 갱신 후 다시 만든다.
-        new_agent, info = self.replace(_infer_cache=None)._update_jit(
+        base = self.replace(_infer_cache=None)
+        # freeze_pi05_actor면 build_pi05가 메모리 절약을 위해 target_actor_params를
+        # actor_train_state와 '같은 버퍼'로 공유한다(사본 미생성). 그런데 _update_jit이
+        # donate_argnums=(0,)로 self를 통째 donate하므로, self 안에 동일 버퍼가 2번 잡혀
+        # "Attempt to donate the same buffer twice"로 크래시한다. frozen이면 update_actor를
+        # 건너뛰어 target_actor_params는 한 번도 읽히지 않는 죽은 참조이므로, JIT에 넘기는
+        # transient(base)에서만 None으로 끊어 별칭을 제거한다(결과/메모리 불변).
+        # 단, 루프/체크포인트에 남는 agent는 원래 구조를 유지해야 하므로(_split_params가
+        # 이 필드를 agent 안에 그대로 직렬화 → resume 템플릿과 구조 일치 필요) 업데이트 후
+        # 다시 공유 버퍼로 재부착한다. frozen은 actor가 불변이라 get_params는 무비용.
+        if self.freeze_pi05_actor:
+            base = base.replace(target_actor_params=None)
+        new_agent, info = base._update_jit(
             batch, utd_ratio, actor_batch
         )
+        if self.freeze_pi05_actor:
+            new_agent = new_agent.replace(
+                target_actor_params=self.actor.get_params(new_agent.actor_train_state)
+            )
         return new_agent.cache_infer_params(), info
 
 

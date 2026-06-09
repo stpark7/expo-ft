@@ -74,10 +74,19 @@ def pi05_init_train_state(
     *,
     resume: bool,
     is_target: bool = False,
+    freeze_actor: bool = False,
 ) -> tuple[training_utils.TrainState, Any]:
-    tx = _optimizer.create_optimizer(
-        config.optimizer, config.lr_schedule, weight_decay_mask=None
-    )
+    # freeze_actor=True면 pi0.5 base를 전혀 업데이트하지 않으므로 Adam 옵티마이저 상태
+    # (모멘트 m,v)를 만들지 않는다. set_to_zero는 init이 EmptyState라 opt_state VRAM이 ~0이고,
+    # 혹시 train_step이 호출돼도 grad를 0으로 만들어 동결을 보장한다. 학습가능 파라미터
+    # (LoRA/action expert) '자체'는 forward(샘플링)에 필요하니 그대로 둔다 — 줄이는 건 옵티마이저 상태뿐.
+    # ⚠️ opt_state 구조가 바뀌므로, 이 변경 이전(full Adam state)에 저장한 체크포인트로는 resume 불가.
+    if freeze_actor:
+        tx = optax.set_to_zero()
+    else:
+        tx = _optimizer.create_optimizer(
+            config.optimizer, config.lr_schedule, weight_decay_mask=None
+        )
 
     def init(
         rng: at.KeyArrayLike, partial_params: at.Params | None = None
@@ -230,6 +239,11 @@ def build_pi05(config, seed, mesh, data_sharding, replicated_sharding,
     from expo_ft.utils.train_utils import build_pi05_config
     agent_kwargs, pi05_train_config, pi05_resize_size, _ = build_pi05_config(config)
     freeze_encoder = agent_kwargs.pop("freeze_pi05_encoder", False)
+    # freeze_pi05_actor=True면 base pi0.5를 전혀 학습하지 않는다 → (1) Adam 옵티마이저 상태(~3.5GiB)와
+    # (2) target_actor_params 두 번째 사본(~7.4GiB)을 만들지 않아 VRAM ~11GiB를 절약한다.
+    # ⚠️ pop이 아니라 get: EXPOLearner.create가 self.freeze_pi05_actor로 다시 읽어 update_actor를 스킵하므로
+    #    agent_kwargs에 그대로 남겨둬야 한다.
+    freeze_actor = bool(agent_kwargs.get("freeze_pi05_actor", False))
 
     rng = jax.random.PRNGKey(seed)
     init_rng, rng = jax.random.split(rng)
@@ -245,8 +259,11 @@ def build_pi05(config, seed, mesh, data_sharding, replicated_sharding,
         replicated_sharding=replicated_sharding,
         freeze_pi05_encoder=freeze_encoder,
         infer_device=jax.devices()[0],
+        freeze_actor=freeze_actor,
     )
-    if resume:
+    if resume or freeze_actor:
+        # frozen이거나 resume이면 새 사본을 만들지 않고 현재 actor params를 그대로 참조(추가 VRAM 0).
+        # frozen일 때 target_actor_params는 update_actor(스킵됨)에서만 읽히므로 참조 공유로 충분하다.
         target_actor_params = actor.get_params(actor_train_state)
     else:
         target_actor_params = actor.init_target_params(target_rng, resume=resume)
@@ -362,6 +379,7 @@ class Pi05Agent(Model):
         default_prompt: Optional[str] = None,
         freeze_pi05_encoder: bool = False,
         infer_device: Optional[jax.Device] = None,
+        freeze_actor: bool = False,
     ) -> tuple["Pi05Agent", Any]:
         """Initialize a Pi05Agent instance using init_train_state."""
         train_state, train_state_sharding = pi05_init_train_state(
@@ -370,6 +388,7 @@ class Pi05Agent(Model):
             mesh,
             resume=resume,
             is_target=False,
+            freeze_actor=freeze_actor,
         )
 
         agent = cls(
