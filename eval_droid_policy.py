@@ -17,7 +17,6 @@ from __future__ import annotations
 import logging
 import os
 import time
-from collections import deque
 
 import etils.epath as epath
 import jax
@@ -30,6 +29,7 @@ from expo_ft.data.replay_buffer import create_replay_buffer
 from expo_ft.env.env_client import EnvClientWrapper
 from expo_ft.env.droid_utils import process_droid_dataset
 from expo_ft.env.robocasa_utils import process_robocasa_dataset
+from expo_ft.utils.eval_utils import run_eval_episodes, per_prompt_breakdown
 
 import openpi.training.sharding as openpi_sharding
 
@@ -62,6 +62,10 @@ FLAGS = flags.FLAGS
 flags.DEFINE_string("dataset_path", "", "Path to DROID dataset (for example_action).")
 flags.DEFINE_integer("num_data", 1, "Number of episodes to load from dataset (only need 1 for example_action).")
 flags.DEFINE_integer("seed", 42, "Random seed.")
+# ≥0이면 모든 eval 에피소드를 이 seed 하나로 reset해 단일 고정 장면만 평가한다
+# (train_pi_robo의 --fix_env_seed와 같은 값을 주면 '학습한 그 장면'의 성공률을 측정).
+# <0(기본)이면 기존대로 에피소드별 seed=FLAGS.seed+ep로 다양한 장면 세트를 평가.
+flags.DEFINE_integer("fix_env_seed", -1, "≥0이면 모든 sim eval 에피소드를 이 seed로 단일 고정 장면 평가. <0이면 에피소드별 seed+ep.")
 # 체크포인트 디렉터리와 불러올 step. step 미지정 시 가장 최신 step을 자동 선택.
 flags.DEFINE_string("checkpoint_dir", "", "Checkpoint directory (e.g. .../checkpoints/<run_name>/checkpoints).")
 flags.DEFINE_integer("checkpoint_step", None, "Checkpoint step to load; default is latest.")
@@ -259,141 +263,36 @@ def main(_):
 
     time.sleep(10)  # 실로봇 하드웨어 안정화 대기(첫 reset 직후). sim에선 불필요한 지연.
 
-    # ── 9. 평가 루프: num_episodes 만큼 에피소드를 굴리고 성공/리턴/길이 집계 ─
-    successes = []        # 에피소드별 성공 여부
-    episode_returns = []  # 에피소드별 누적 보상
-    episode_lengths = []  # 에피소드별 스텝 수
-    episode_prompts = []  # 에피소드별 언어 지시문(대상 객체) — 객체별 성공 분해용
-
-    for ep in range(FLAGS.num_episodes):
-        # 재현평가: sim은 에피소드별 고정 seed(=base_seed+ep)로 reset해, 실행마다
-        # 동일한 장면·대상객체·언어 지시문 세트를 평가한다(객체가 무작위로 매번 바뀌면
-        # 성공률이 실행마다 달라지고 어떤 객체가 나왔는지도 통제 못함). base_seed는
-        # FLAGS.seed를 재사용한다. droid(실로봇)는 시드로 장면을 고정할 수 없어 None.
-        reset_seed = (FLAGS.seed + ep) if config_task.env_type == "sim" else None
-        logger.info("Episode %d / %d (reset_seed=%s)", ep + 1, FLAGS.num_episodes, reset_seed)
-        observation = env.reset(seed=reset_seed)
-        # 이 에피소드에 sim이 샘플한 언어 지시문(=대상 객체). VLA가 실제로 받는 프롬프트이며,
-        # 동일 seed면 실행마다 같아야 한다. 객체별 성공/실패를 사후에 분해할 수 있게 기록한다.
-        ep_prompt = observation.get("prompt", "") if isinstance(observation, dict) else ""
-        logger.info("  prompt: %r", ep_prompt)
-        start_time = time.time()
-        action_plan = deque()       # 샘플한 액션 청크를 담아 한 스텝씩 꺼내 실행하는 큐
-        sample_info_history = []
-        ep_return = 0.0
-        ep_len = 0
-
-        # max_traj_len 은 done(성공)이 안 떠도 에피소드를 강제 종료하는 스텝 상한.
-        for step in range(max_traj_len):
-            step_t0 = time.time()
-            # 단계별 소요시간(ms) 측정용 — 정책 추론이 제어 주기를 못 따라가는지 진단에 쓴다.
-            timing = {
-                "wait_ms": 0.0,
-                "obs_ms": 0.0,
-                "info_ms": 0.0,
-                "plan_ms": 0.0,
-                "act_ms": 0.0,
-            }
-
-            # (a) 현재 관측 수신
-            t_obs0 = time.time()
-            observation = env.get_observation()
-            timing["obs_ms"] = (time.time() - t_obs0) * 1000.0
-            # (b) 직전 스텝의 결과(done/success/reward) 수신. 첫 스텝은 reset 직후 상태.
-            t_info0 = time.time()
-            done, success, reward, _ = env.get_info_for_step()
-            timing["info_ms"] = (time.time() - t_info0) * 1000.0
-
-            # (c) 큐가 비었을 때만 정책 추론 → 청크에서 replan_steps개만 큐에 적재.
-            #     only_base_actions=True면 residual/critic 없이 pi0.5 base 액션만 사용.
-            t_plan0 = time.time()
-            if not action_plan:
-                action_chunk, agent, new_si = agent.sample_actions(
-                    observation,
-                    only_base_actions=FLAGS.only_base_actions,
-                )
-                action_chunk = np.asarray(jax.device_get(action_chunk))  # JAX→numpy (host로 가져옴)
-                if action_chunk.ndim == 1:
-                    action_chunk = action_chunk[None, :]  # 단일 액션이면 [1, dim]으로 보정
-                action_plan.extend(list(action_chunk[: FLAGS.replan_steps]))
-                sample_info_history.append(new_si)
-            else:
-                # 큐에 액션이 남아있으면 추론 생략(직전 sample_info 재사용).
-                sample_info_history.append(sample_info_history[-1] if sample_info_history else None)
-            timing["plan_ms"] = (time.time() - t_plan0) * 1000.0
-            action = action_plan.popleft()  # 이번 스텝에 실행할 액션 하나
-
-            ep_return += reward
-            ep_len += 1
-
-            # (d) 직전 스텝에서 done이 떴으면(=성공/종료) 실행하지 않고 에피소드 종료.
-            if done:
-                timing_total_ms = (time.time() - step_t0) * 1000.0
-                logger.info(
-                    "[timing][ep %d step %d] total=%.1fms wait=%.1f obs=%.1f info=%.1f plan=%.1f act=%.1f done=%s",
-                    ep + 1,
-                    step,
-                    timing_total_ms,
-                    timing["wait_ms"],
-                    timing["obs_ms"],
-                    timing["info_ms"],
-                    timing["plan_ms"],
-                    timing["act_ms"],
-                    done,
-                )
-                break
-
-            # (e) 제어 주기(dt) 유지: 직전 스텝 종료 후 dt가 안 지났으면 남는 만큼 대기.
-            #     DROID 수집 루프와 동일한 타이밍을 맞추기 위함(실시간 페이싱).
-            elapsed = time.time() - start_time
-            sleep_left = dt - elapsed
-            if sleep_left > 0:
-                t_wait0 = time.time()
-                time.sleep(sleep_left)
-                timing["wait_ms"] = (time.time() - t_wait0) * 1000.0
-
-            # (f) 액션을 환경에 실행(WebSocket RPC). 다음 스텝의 dt 기준점을 갱신.
-            t_act0 = time.time()
-            env.step(np.asarray(action).tolist())
-            timing["act_ms"] = (time.time() - t_act0) * 1000.0
-            start_time = time.time()
-
-            timing_total_ms = (time.time() - step_t0) * 1000.0
-            logger.info(
-                "[timing][ep %d step %d] total=%.1fms wait=%.1f obs=%.1f info=%.1f plan=%.1f act=%.1f done=%s",
-                ep + 1,
-                step,
-                timing_total_ms,
-                timing["wait_ms"],
-                timing["obs_ms"],
-                timing["info_ms"],
-                timing["plan_ms"],
-                timing["act_ms"],
-                done,
-            )
-
-        # 에피소드 종료(성공으로 break 했거나 스텝 상한 도달) → 결과 누적.
-        successes.append(success)
-        episode_returns.append(ep_return)
-        episode_lengths.append(ep_len)
-        episode_prompts.append(ep_prompt)
-        logger.info("  success=%s return=%.1f len=%d prompt=%r", success, ep_return, ep_len, ep_prompt)
+    # ── 9. 평가 루프: 공용 eval 유틸로 num_episodes 만큼 굴려 성공/리턴/길이 집계 ─
+    # run_eval_episodes는 학습 중 평가(train_pi_robo*.py)와 '동일한' 롤아웃 로직이다
+    # (단일 소스 → 학습 중 본 성공률과 최종 eval 성공률이 어긋나지 않음). reset seed 규칙
+    # (droid=None / sim+fix_env_seed≥0=단일 고정 / sim=seed+ep)도 그 안에서 동일하게 처리된다.
+    # log_timing=True로 per-step 타이밍 로그(제어주기 추종 진단)를 그대로 남긴다.
+    result, agent = run_eval_episodes(
+        env, agent,
+        config_task=config_task,
+        num_episodes=FLAGS.num_episodes,
+        base_seed=FLAGS.seed,
+        fix_env_seed=FLAGS.fix_env_seed,
+        replan_steps=FLAGS.replan_steps,
+        only_base_actions=FLAGS.only_base_actions,
+        dt=dt,
+        log_timing=True,
+        logger=logger,
+    )
 
     # ── 10. 전체 집계 출력: 성공률 / 평균 리턴 / 평균 길이 ───────────────
-    n = len(successes)
-    success_rate = float(np.mean(successes))
-    mean_return = float(np.mean(episode_returns))
-    mean_len = float(np.mean(episode_lengths))
+    n = result["n"]
+    success_rate = result["success_rate"]
+    mean_return = result["mean_return"]
+    mean_len = result["mean_len"]
     logger.info("Evaluation complete: success_rate=%.2f (%d/%d) mean_return=%.2f mean_len=%.1f",
-                success_rate, int(np.sum(successes)), n, mean_return, mean_len)
+                success_rate, int(np.sum(result["successes"])), n, mean_return, mean_len)
 
     # 지시문(대상 객체)별 성공 분해 — sim에서 에피소드마다 다른 객체가 나오므로,
     # 어떤 객체에서 성공/실패했는지 집계해 단일 성공률 뒤에 가려진 편차를 드러낸다.
-    if any(p for p in episode_prompts):
-        per_prompt: dict = {}
-        for p, s in zip(episode_prompts, successes):
-            hit, tot = per_prompt.get(p, (0, 0))
-            per_prompt[p] = (hit + int(bool(s)), tot + 1)
+    if any(p for p in result["prompts"]):
+        per_prompt = per_prompt_breakdown(result)
         logger.info("Per-instruction success (%d distinct):", len(per_prompt))
         for p in sorted(per_prompt):
             hit, tot = per_prompt[p]
