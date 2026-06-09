@@ -23,6 +23,7 @@ from expo_ft.env.droid_utils import process_droid_dataset
 from expo_ft.env.robocasa_utils import process_robocasa_dataset
 from expo_ft.utils.log_utils import EpisodeState, TrainingStats
 from expo_ft.utils.train_utils import get_batch_info, init_logging, init_wandb
+from expo_ft.utils.eval_utils import TrainingEvaluator
 
 import openpi.training.sharding as openpi_sharding
 
@@ -34,7 +35,11 @@ FLAGS = flags.FLAGS
 flags.DEFINE_string("project_name", "expo-ft", "wandb project name.")
 flags.DEFINE_string("run_name", None, "Optional wandb run name.")
 flags.DEFINE_float("offline_ratio", 0.0, "Offline batch fraction; 0 inserts dataset into online replay buffer.")
+flags.DEFINE_boolean("truncate_offline_at_success", False, "RoboCasa 데모를 첫 성공 프레임에서 잘라 done=1로(단일-terminal 보상). 온라인과 n-step 타깃 일관성(DICE-RL ph_finetune식).")
 flags.DEFINE_integer("seed", 42, "Random seed.")
+# ≥0이면 매 에피소드 이 seed로 sim 장면(레이아웃·스타일·객체·배치·로봇포즈·언어지시문)을
+# 단일 고정 환경으로 묶는다(환경 다양성이 학습 실패 원인인지 진단용). <0이면 무작위.
+flags.DEFINE_integer("fix_env_seed", -1, "If >=0, reset every episode with this seed to pin the sim scene (single-env training/diagnosis). <0 = random each episode.")
 flags.DEFINE_float("ep_timeout_secs", 120.0, "Pause update thread if no episode finishes within this many seconds. 0 to disable.")
 flags.DEFINE_integer("batch_size", 64, "Mini batch size.")
 flags.DEFINE_integer("max_steps", 100_000, "Number of training steps.")
@@ -54,6 +59,17 @@ flags.DEFINE_string("client_host", "localhost", "Host for environment operations
 flags.DEFINE_integer("client_port", 8102, "Port for environment operations server.")
 
 flags.DEFINE_integer("replan_steps", 8, "Number of replan steps for evaluation.")
+
+# --- 학습 중 주기적 평가(in-training eval) ---
+# 학습이 잘 되는지 끝까지 기다리지 않고, 일정 env 스텝마다 에피소드 경계에서 잠시 멈추고
+# 결정적 seed로 평가 에피소드를 굴려 성공률/리턴/길이를 찍는다(업데이트/버퍼 삽입 없음).
+# async 루프에선 actor(메인 스레드)가 평가 롤아웃을 도는 동안 learner 스레드는 device[1:]
+# 에서 계속 업데이트한다(샘플은 device[0]이라 경합 없음). 단, 평가 동안 학습 에피소드가
+# 안 끝나 ep_timeout_secs가 지나면 learner가 잠시 멈췄다 다음 실제 에피소드에서 재개한다.
+flags.DEFINE_integer("eval_interval", 0, "N env 스텝마다 에피소드 경계에서 평가 실행. 0이면 비활성.")
+flags.DEFINE_integer("eval_episodes", 10, "평가 1회당 굴릴 에피소드 수(실시간 페이싱이라 작게).")
+flags.DEFINE_integer("eval_seed", -1, "평가 reset seed의 base(sim: seed+ep). <0이면 FLAGS.seed 사용.")
+flags.DEFINE_boolean("eval_base_at_start", False, "학습 시작 전 pi0.5 base 정책만 1회 평가(비교 기준선).")
 
 flags.DEFINE_string("dataset_path", "", "Path to the dataset.")
 config_flags.DEFINE_config_file(
@@ -135,6 +151,7 @@ def main(_):
             FLAGS.dataset_path,
             FLAGS.config_task,
             num_data=FLAGS.num_data,
+            truncate_at_success=FLAGS.truncate_offline_at_success,
         )
     else:
         raise ValueError(f"Unsupported dataset type: {FLAGS.config_task.env_type}")
@@ -244,7 +261,10 @@ def main(_):
 
     dt = 1.0 / FLAGS.config_task.control_hz
     done = False
-    env.reset()
+    # fix_env_seed>=0 → pin sim scene to a single fixed environment every episode
+    # (None = random each episode). The per-episode reset below reuses the same value.
+    fix_seed = FLAGS.fix_env_seed if FLAGS.fix_env_seed >= 0 else None
+    env.reset(seed=fix_seed)
     start_step_time = time.time()
     env.step(FLAGS.config_task.example_action.squeeze().tolist())
     action_plan = deque()
@@ -264,6 +284,13 @@ def main(_):
     _stop_event = threading.Event()
     _can_update = threading.Event()
     _episode_done = threading.Event()
+    # 평가(in-training eval)가 메인 스레드에서 도는 동안 set된다. learner는 이 동안
+    # ep_timeout_secs '에피소드 미종료' 타임아웃을 보류한다 — 평가는 학습 에피소드를
+    # 진행시키지 않으므로(버퍼 삽입 없음), 길어지면 learner가 헛되이 "pausing updates"를
+    # 찍어 wandb update_paused 지표가 1↔0으로 깜빡인다(모니터링 잡음). learner는 평가 동안
+    # 계속 업데이트하는 게 정상 동작이므로(샘플 device[0] / 업데이트 device[1:], env 비접근),
+    # 타임아웃만 억제하면 된다.
+    _eval_active = threading.Event()
     _update_count = [0]
     _ckpt_request = [None]  # main thread sets step number; update thread saves and clears
     _ckpt_done = threading.Event()
@@ -277,7 +304,10 @@ def main(_):
         _can_update.wait()
         while not _stop_event.is_set():
             try:
-                if FLAGS.ep_timeout_secs > 0 and time.time() - last_episode_time > FLAGS.ep_timeout_secs:
+                # 평가 중엔 타임아웃 기준 시각을 계속 끌어올려 헛된 pause 로그/지표 깜빡임을 막는다.
+                if _eval_active.is_set():
+                    last_episode_time = time.time()
+                if FLAGS.ep_timeout_secs > 0 and not _eval_active.is_set() and time.time() - last_episode_time > FLAGS.ep_timeout_secs:
                     logging.info("No episode finished for %.1fs, pausing updates.", FLAGS.ep_timeout_secs)
                     wandb.log({"training/update_paused": 1}, step=_env_step[0])
                     _episode_done.wait()
@@ -345,6 +375,34 @@ def main(_):
         _can_update.set()
         logging.info("Resuming: replay buffer already warm, update thread starting immediately.")
 
+    # --- 학습 중 평가 헬퍼 ---
+    # 메인 스레드(actor)가 평가 롤아웃을 도는 동안 learner 스레드는 그대로 업데이트한다.
+    # 평가는 _actor_agent로 샘플하며(파라미터 불변, rng만 진행) 반환 agent를 다시 받는다.
+    # 평가 중엔 _published 캐시를 당겨오지 않으므로 한 정책 스냅샷으로 일관되게 측정된다.
+    # base_seed: 평가 reset seed의 base. 매 평가 동일 장면 세트 재현(<0이면 FLAGS.seed).
+    # active_flag=_eval_active: 평가 롤아웃 동안 learner의 스퍼리어스 타임아웃 pause를
+    # 억제한다(평가 중에도 learner는 계속 업데이트).
+    evaluator = TrainingEvaluator(
+        env=env,
+        config_task=FLAGS.config_task,
+        num_episodes=FLAGS.eval_episodes,
+        base_seed=FLAGS.eval_seed if FLAGS.eval_seed >= 0 else FLAGS.seed,
+        fix_env_seed=FLAGS.fix_env_seed,
+        replan_steps=FLAGS.replan_steps,
+        dt=dt,
+        reset_seed=fix_seed,
+        active_flag=_eval_active,
+    )
+
+    # 학습 시작 전 기준선 평가(step0): pi0.5 base 정책만. learner는 아직 _can_update 대기 중이라
+    # 유휴 상태. full(residual+critic)은 step0엔 critic이 랜덤이라 무작위 선택일 뿐이라 재지 않는다.
+    if FLAGS.eval_base_at_start:
+        _actor_agent = evaluator.run_base(_actor_agent, start_step)
+        start_step_time = time.time()
+        action_plan.clear()
+
+    last_eval_step = start_step  # 마지막 평가를 돌린 env 스텝(eval_interval 트리거 기준)
+
     for i in tqdm.tqdm(
         range(start_step, FLAGS.max_steps + 1), smoothing=0.1, disable=not FLAGS.tqdm
     ):
@@ -401,7 +459,14 @@ def main(_):
             with _buffer_lock:
                 batch_processor.on_episode_done(success)
             _episode_done.set()
-            env.reset()
+
+            # (eval) 주기적 인-트레이닝 평가: eval_interval env 스텝마다 에피소드 경계에서.
+            # learner 스레드는 device[1:]에서 계속 돈다(샘플은 device[0]이라 경합 없음).
+            if FLAGS.eval_interval > 0 and (i - last_eval_step) >= FLAGS.eval_interval:
+                last_eval_step = i
+                _actor_agent = evaluator.run(_actor_agent, i)  # 전체 정책 평가(run_base는 시작 전 기준선용)
+
+            env.reset(seed=fix_seed)
 
             training_log.on_episode_done(episode_log, success, step_metrics)
             episode_log.reset()

@@ -22,6 +22,7 @@ from expo_ft.env.droid_utils import process_droid_dataset
 from expo_ft.env.robocasa_utils import process_robocasa_dataset
 from expo_ft.utils.log_utils import EpisodeState, TrainingStats
 from expo_ft.utils.train_utils import get_batch_info, init_logging, init_wandb
+from expo_ft.utils.eval_utils import TrainingEvaluator
 
 import openpi.training.sharding as openpi_sharding
 
@@ -41,7 +42,12 @@ flags.DEFINE_string("project_name", "expo-ft", "wandb 프로젝트 이름")
 flags.DEFINE_string("run_name", None, "wandb 런 이름 (로그/체크포인트 디렉터리 이름으로도 쓰임)")
 # 오프라인 배치 비율: 0이면 데모를 온라인 버퍼에 바로 삽입, >0이면 별도 오프라인 버퍼를 두고 그 비율로 섞음
 flags.DEFINE_float("offline_ratio", 0.0, "Offline batch fraction; 0 inserts dataset into online replay buffer.")
+flags.DEFINE_boolean("truncate_offline_at_success", False, "RoboCasa 데모를 첫 성공 프레임에서 잘라 done=1로(단일-terminal 보상). 온라인과 n-step 타깃 일관성(DICE-RL ph_finetune식).")
 flags.DEFINE_integer("seed", 42, "랜덤 시드")
+# ≥0이면 매 에피소드 이 seed로 sim을 reset해 장면(레이아웃·스타일·객체·배치·로봇포즈·
+# 언어지시문)을 단일 고정 환경으로 묶는다. 학습이 안 되는 게 환경 다양성 때문인지
+# 진단하는 용도. <0(기본)이면 기존대로 매 에피소드 무작위 장면.
+flags.DEFINE_integer("fix_env_seed", -1, "≥0이면 매 에피소드 이 seed로 sim 장면 고정(단일 환경 학습/진단). <0이면 무작위.")
 
 # --- 학습 스케줄 (핵심) ---
 # 그래디언트 업데이트를 언제 돌릴지: 에피소드마다 / 스텝마다 / 에피소드 묶음마다
@@ -49,7 +55,7 @@ flags.DEFINE_enum("update_type", "episode", ["episode", "step", "batch"], "When 
 flags.DEFINE_integer("num_updates", 1, "트리거(에피소드/스텝/배치) 1회당 그래디언트 업데이트 횟수")
 flags.DEFINE_integer("num_batch", 1, "update_type=batch 일 때 몇 에피소드를 모아 한 번 업데이트할지")
 flags.DEFINE_integer("batch_size", 64, "미니배치 크기 (디바이스 수로 나누어떨어져야 함)")
-flags.DEFINE_integer("max_steps", 100_000, "총 학습 스텝 수")
+flags.DEFINE_integer("max_steps", 300_000, "총 학습 스텝 수")
 # 리플레이 버퍼 capacity를 max_steps에서 분리한다. 0이면 기존 동작(=max_steps)으로 폴백.
 # 버퍼는 np.empty로 capacity만큼 잡고 채워지는 만큼 호스트 RAM이 fault된다. capacity가
 # max_steps(기본 100k)에 묶여 있으면 학습이 길어질수록 온라인 버퍼가 ~58GB까지 자라고,
@@ -78,6 +84,18 @@ flags.DEFINE_integer("client_port", 8102, "환경(로봇) 클라이언트 포트
 
 # 한 번 샘플한 액션 청크에서 실제로 실행할 스텝 수
 flags.DEFINE_integer("replan_steps", 8, "Number of replan steps for evaluation.")
+
+# --- 학습 중 주기적 평가(in-training eval) ---
+# 학습이 잘 되는지 끝까지 기다리지 않고 중간에 보기 위해, 일정 env 스텝마다 에피소드
+# 경계에서 잠시 멈추고 결정적 seed로 평가 에피소드를 굴려 성공률/리턴/길이를 찍는다.
+# 평가 동안엔 그래디언트 업데이트도, 리플레이 버퍼 삽입도 없다(env/agent를 읽기만 함).
+# 평가용 환경이 따로 없으므로(원격 클라이언트가 환경 1개 소유) 같은 env를 재사용하고,
+# 평가가 끝나면 학습 재개를 위해 env.reset()을 한 번 더 한다. 실시간 페이싱이라 비용이
+# 크니 eval_episodes는 작게(기본 10).
+flags.DEFINE_integer("eval_interval", 0, "N env 스텝마다 에피소드 경계에서 평가 실행. 0이면 비활성.")
+flags.DEFINE_integer("eval_episodes", 10, "평가 1회당 굴릴 에피소드 수(실시간 페이싱이라 작게).")
+flags.DEFINE_integer("eval_seed", -1, "평가 reset seed의 base(sim: seed+ep). <0이면 FLAGS.seed 사용. 매 평가 동일 장면 세트 재현용.")
+flags.DEFINE_boolean("eval_base_at_start", False, "학습 시작 전 pi0.5 base 정책만 1회 평가(RL이 base를 넘는지 비교 기준선).")
 
 flags.DEFINE_string("dataset_path", "", "오프라인 데모 데이터셋 경로")
 
@@ -119,7 +137,6 @@ def main(_):
     )
 
     # FSDP mesh와 샤딩 정의: data_sharding=배치 축 분할, replicated=모든 디바이스에 복제
-    # !
     mesh = openpi_sharding.make_mesh(FLAGS.fsdp_devices)
     data_sharding = jax.sharding.NamedSharding(
         mesh, jax.sharding.PartitionSpec(openpi_sharding.DATA_AXIS)
@@ -159,10 +176,12 @@ def main(_):
         )
     elif FLAGS.config_task.env_type == 'sim':
         # RoboCasa365 LeRobot 데모 -> arm 7차원 action + 16차원 state transition.
+        # 목적 : 1) RoboCasa365 시뮬레이터에서 학습하려는 태스크에 맞는 포맷으로 데모를 가공
         dataset = process_robocasa_dataset(
             FLAGS.dataset_path,
             FLAGS.config_task,
             num_data=FLAGS.num_data,
+            truncate_at_success=FLAGS.truncate_offline_at_success,
         )
     else:
         raise ValueError(f"Unsupported dataset type: {FLAGS.config_task.env_type}")
@@ -305,14 +324,38 @@ def main(_):
 
     # ── 9. 메인 루프 준비 ────────────────────────────────────────────────
     dt = 1.0 / FLAGS.config_task.control_hz  # 제어 주기(초). 기본 10Hz → 0.1s
-    done = False
-    env.reset()
+    # fix_env_seed≥0이면 매 에피소드 같은 seed로 reset해 단일 고정 장면으로 학습한다
+    # (None이면 매 에피소드 무작위). 아래 에피소드 종료 후 reset도 같은 값을 쓴다.
+    fix_seed = FLAGS.fix_env_seed if FLAGS.fix_env_seed >= 0 else None
+
+    # ── 9-1. 평가 헬퍼 & 학습 시작 전 기준선 평가 ────────────────────────
+    # base_seed: 평가 reset seed의 base. 매 평가 동일 장면 세트를 재현(<0이면 FLAGS.seed).
+    # 고정 설정은 여기서 한 번만 넘기고, 호출부는 run()/run_base()만 쓴다.
+    evaluator = TrainingEvaluator(
+        env=env,
+        config_task=FLAGS.config_task,
+        num_episodes=FLAGS.eval_episodes,
+        base_seed=FLAGS.eval_seed if FLAGS.eval_seed >= 0 else FLAGS.seed,
+        fix_env_seed=FLAGS.fix_env_seed,
+        replan_steps=FLAGS.replan_steps,
+        dt=dt,
+        reset_seed=fix_seed,
+    )
+    # 학습 시작 전 기준선 평가(step0): pi0.5 base 정책의 성공률(RL이 이걸 넘는지 비교 기준).
+    # full(residual+critic)은 step0엔 critic이 랜덤이라 무작위 선택일 뿐이라 재지 않는다.
+    if FLAGS.eval_base_at_start:
+        agent = evaluator.run_base(agent, start_step)
+
+    # ── 9-2. 루프 런타임 상태 초기화 ─────────────────────────────────────
+    env.reset(seed=fix_seed)
     start_step_time = time.time()
     env.step(FLAGS.config_task.example_action.squeeze().tolist())  # 첫 더미 스텝으로 파이프라인 워밍업
+    done = False
     action_plan = deque()       # 샘플한 액션 청크를 담는 큐 (popleft로 한 스텝씩 소비)
     action_type = "policy"      # "policy"=정책 실행, "human"=사람 개입 중
     episodes_since_update = 0   # update_type=batch 일 때 누적 에피소드 카운터
     combine_rng = jax.random.PRNGKey(FLAGS.seed + 100)
+    last_eval_step = start_step  # 마지막 평가를 돌린 env 스텝(eval_interval 트리거 기준)
 
     # 그래디언트 업데이트 묶음. nonlocal로 바깥 스코프의 agent/rng를 갱신
     def run_agent_updates(num_updates: int, metrics: dict):
@@ -389,7 +432,15 @@ def main(_):
         # (g) 에피소드 종료 처리
         if done:
             batch_processor.on_episode_done(success)
-            env.reset()
+
+            # (eval) 주기적 인-트레이닝 평가: eval_interval env 스텝마다 에피소드 경계에서
+            # 잠시 멈추고 결정적 seed로 평가 에피소드를 굴린다. evaluator.run이 평가 후 env를
+            # 다시 reset하므로, 아래 학습용 env.reset과 합쳐 깨끗한 상태로 이어진다.
+            if FLAGS.eval_interval > 0 and (i - last_eval_step) >= FLAGS.eval_interval:
+                last_eval_step = i
+                agent = evaluator.run(agent, i)  # 전체 정책 평가(run_base는 시작 전 기준선용)
+
+            env.reset(seed=fix_seed)
 
             # update_type에 따라 에피소드 종료 시점에 업데이트 (episode=매번, batch=num_batch마다)
             if FLAGS.update_type == "episode" and can_update:
