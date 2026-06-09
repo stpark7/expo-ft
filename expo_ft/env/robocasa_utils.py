@@ -51,7 +51,9 @@ def process_robocasa_dataset(
     datapath,
     task_config=None,
     episode_indices=None,
-    num_data=None):
+    num_data=None,
+    truncate_at_success=False,
+    reward_success_threshold=0.5):
     """
     오프라인 RoboCasa365 LeRobot 데모를 리플레이 버퍼 transition 리스트로 펼친다.
 
@@ -65,12 +67,26 @@ def process_robocasa_dataset(
       * reward/done : parquet next.reward / next.done 그대로(온라인 env reward와 일관).
       * prompt : task_index -> meta/tasks.jsonl 문자열.
 
+    n-step value 일관성(truncate_at_success):
+        온라인 env(robocasa_env)는 첫 성공에서 즉시 종료(done/mask=0)하므로 성공
+        transition의 n-step critic 타깃이 ≈1.0이다. 반면 LeRobot 데모는 성공 보상
+        (reward=1)을 마지막 ~16프레임 동안 그대로 유지(held)하고 done은 맨 끝 1프레임에만
+        둔다. 그러면 첫 성공 프레임의 n-step 타깃이 Σγ^i(=replan_steps=8·γ=0.99이면
+        7.726)+부트스트랩으로 부풀어, 같은 성공 사건에 대해 offline(≈7.7) / online(≈1.0)
+        critic 타깃이 어긋난다(DICE-RL ph_pretrain↔ph_finetune 불일치).
+        truncate_at_success=True면 각 데모를 '첫 성공 프레임'에서 잘라 그 프레임을
+        done=1/mask=0으로 만든다 → 온라인과 동일한 단일-terminal 보상(타깃 ≈1.0).
+        trailing held-reward 프레임은 버린다(거의 중복 success state라 정보 손실 미미).
+        디스크 데이터는 건드리지 않고 로드 시에만 적용하므로 플래그로 A/B 가능.
+
     Args:
         datapath: LeRobot 데이터셋 루트(meta/info.json 보유). 'lerobot/' 하위로 한
             단계 들어가야 하면 자동 처리.
         task_config: 사용하지 않음(process_droid_dataset과 시그니처를 맞추기 위함).
         episode_indices: 사용할 에피소드 인덱스 목록. None이면 전체(또는 num_data).
         num_data: episode_indices가 None일 때 앞에서부터 사용할 에피소드 수.
+        truncate_at_success: True면 첫 성공 프레임에서 에피소드를 자르고 done=1로 표시.
+        reward_success_threshold: 성공 판정 reward 임계값(sparse 0/1이므로 0.5).
 
     Returns:
         타임스텝 transition dict 리스트. 각 dict는 observations, actions(7,), rewards,
@@ -108,6 +124,9 @@ def process_robocasa_dataset(
     print(f"Find {total_eps} episodes; using {len(ep_list)}")
 
     data = []
+    _trunc_demos = 0       # 첫 성공에서 잘린 데모 수
+    _trunc_frames = 0      # 버려진 trailing 프레임 총합
+    _no_success_demos = 0  # 성공 프레임이 없어 자르지 못한 데모 수
     for ep in tqdm(ep_list):
         chunk = ep // chunks_size
         pq = os.path.join(root, "data", f"chunk-{chunk:03d}", f"episode_{ep:06d}.parquet")
@@ -131,6 +150,20 @@ def process_robocasa_dataset(
         masks = (1.0 - dones).astype(np.float32)                                                  # (T,)
         prompt = tasks.get(int(df["task_index"].iloc[0]), "")
 
+        # 첫 성공에서 truncate: 온라인(첫 성공 종료)과 n-step 타깃 일관성 맞춤.
+        T_eff = T
+        if truncate_at_success:
+            success_mask = rewards > reward_success_threshold
+            if success_mask.any():
+                success_idx = int(np.argmax(success_mask))   # 첫 성공 프레임
+                T_eff = success_idx + 1                       # 그 프레임까지만 사용
+                dones = dones.copy(); dones[success_idx] = 1.0
+                masks = masks.copy(); masks[success_idx] = 0.0
+                _trunc_demos += 1
+                _trunc_frames += (T - T_eff)
+            else:
+                _no_success_demos += 1                        # 성공 없음 → 전체 유지
+
         # 카메라 3개 디코딩 (각 (T,H,W,3) uint8). 프레임 수는 parquet 행과 1:1.
         # plugin="pyav": in-process 디코딩(av). 기본 ffmpeg 플러그인은 subprocess를
         # fork하는데, JAX(멀티스레드) 초기화 후 fork는 데드락 위험이 있어 피한다.
@@ -145,7 +178,7 @@ def process_robocasa_dataset(
             )
             imgs[out_key] = frames
 
-        for t in range(T):
+        for t in range(T_eff):
             observations = {"observation/state": states[t], "prompt": prompt}
             for out_key in _ROBOCASA_VIDEO_MAP:
                 observations[out_key] = imgs[out_key][t]
@@ -156,5 +189,13 @@ def process_robocasa_dataset(
                 "masks": masks[t],
                 "dones": dones[t],
             })
+
+    if truncate_at_success:
+        avg_trim = (_trunc_frames / _trunc_demos) if _trunc_demos else 0.0
+        print(
+            f"[truncate_at_success] 잘린 데모 {_trunc_demos}/{len(ep_list)}개, "
+            f"버린 프레임 {_trunc_frames}개(데모당 평균 {avg_trim:.1f}프레임), "
+            f"성공없음 {_no_success_demos}개 → 단일-terminal 보상(타깃≈1.0)으로 정렬."
+        )
 
     return data
