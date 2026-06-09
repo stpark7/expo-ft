@@ -15,3 +15,4 @@ client/sim/robosuite/
 client/sim/robocasa365/
 assets/
 .venv/
+html/

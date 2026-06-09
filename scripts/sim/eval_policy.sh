@@ -36,7 +36,8 @@ esac
 CKPT=./checkpoints/robocasa365/pi05_pretrain_human300/multitask_learning/75000
 
 # 평가할 RL 체크포인트(run_server.sh의 output_dir/run_name/checkpoints) + step.
-RL_CKPT_DIR=./log/robocasa_sim/expo_robocasa_pickstove_armfix/checkpoints
+# 환경변수 RL_CKPT_DIR로 덮어쓸 수 있다. 기본은 고정주방(L11S14) run.
+RL_CKPT_DIR="${RL_CKPT_DIR:-./log/robocasa_sim/expo_robocasa_pickstove_fixedkitchen_L11S14/checkpoints}"
 # STEP / N_EPISODES 는 환경변수로 덮어쓸 수 있다(scripts/sim/eval_both.sh가 그렇게 호출한다).
 # 단독 실행 시 기본값은 step 100000 / 100 에피소드.
 STEP="${STEP:-100000}"
