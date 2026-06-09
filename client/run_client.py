@@ -43,11 +43,18 @@ class Args:
     server_host: str = "0.0.0.0"
     server_port: int = 8102
     config_task_path: str = "configs/task/pick.py"
+    # 고정 주방 핀(sim 전용): 둘 다 지정되면 그 (layout, style)로 주방을 고정한다.
+    # env는 이 클라이언트가 생성하므로 여기서 값을 주입해야 실제로 적용된다(서버 플래그 X).
+    # 기본 None = 무작위 주방(기존 동작). 예: --fixed_layout_id=11 --fixed_style_id=14
+    fixed_layout_id: Optional[int] = None
+    fixed_style_id: Optional[int] = None
 
 
 _env_storage: Dict[str, Any] = {}
 _config_task_path: Optional[str] = None
 _task_config: Optional[Any] = None
+_fixed_layout_id: Optional[int] = None
+_fixed_style_id: Optional[int] = None
 
 # Human-in-the-loop: lazy spacemouse for droid envs
 _spacemouse_policy: Optional[Any] = None
@@ -94,6 +101,12 @@ async def _handle_environment_request(websocket: _server.ServerConnection):
                     logger.info(f"Creating environment {env_id}...")
                     env_kwargs = dict(task_config)
                     env_kwargs["video_dir"] = request.get("video_dir") or ""
+                    # 클라이언트 CLI로 고정 주방이 지정됐으면 config 값(None)을 덮어쓴다.
+                    # (env는 여기서만 생성되므로 이 경로로만 주방 핀이 실제 적용된다.)
+                    if _fixed_layout_id is not None:
+                        env_kwargs["fixed_layout_id"] = _fixed_layout_id
+                    if _fixed_style_id is not None:
+                        env_kwargs["fixed_style_id"] = _fixed_style_id
                     env = task_config.env(**env_kwargs)
                     _env_storage[env_id] = env
                     logger.info(f"Environment {env_id} created successfully")
@@ -213,10 +226,14 @@ async def _handle_environment_request(websocket: _server.ServerConnection):
         logger.error(f"Unexpected error in request handler: {e}", exc_info=True)
 
 
-async def _run_server(host: str, port: int, config_task_path: Optional[str]):
+async def _run_server(host: str, port: int, config_task_path: Optional[str],
+                      fixed_layout_id: Optional[int] = None,
+                      fixed_style_id: Optional[int] = None):
     """Run the websocket server for environment operations."""
-    global _config_task_path
+    global _config_task_path, _fixed_layout_id, _fixed_style_id
     _config_task_path = config_task_path
+    _fixed_layout_id = fixed_layout_id
+    _fixed_style_id = fixed_style_id
     logger = logging.getLogger(__name__)
 
     async with _server.serve(
@@ -236,7 +253,10 @@ async def _run_server(host: str, port: int, config_task_path: Optional[str]):
 
 async def main_async(args: Args) -> None:
     """Main async entry point."""
-    await _run_server(args.server_host, args.server_port, args.config_task_path)
+    await _run_server(
+        args.server_host, args.server_port, args.config_task_path,
+        fixed_layout_id=args.fixed_layout_id, fixed_style_id=args.fixed_style_id,
+    )
 
 def main(args: Args) -> None:
     """Main entry point."""

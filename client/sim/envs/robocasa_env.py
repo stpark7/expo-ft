@@ -84,6 +84,25 @@ _ARM_DIM = 7
 _REPAD_TAIL = np.array([0.0, 0.0, 0.0, 0.0, -1.0], dtype=np.float64)  # base_motion(4) + control_mode(1)
 
 
+# ── 성공 판정 근거 진단 ──────────────────────────────────────────────────
+# robocasa PickPlace 계열 task의 _check_success는 보통 두 조건의 AND다:
+#   (1) 대상 객체 obj가 목표 용기 container에 "담김"
+#       = 물리 접촉(env.check_contact) AND  obj·container 수평중심거리 < th
+#   (2) 그리퍼가 obj에서 충분히 "멀어짐" (gripper_obj_far, 기본 th=0.25m)
+# 영상으로는 성공처럼 보이는데 자동판정이 실패로 나오는 대부분의 원인은 (2)다
+# (물체는 담겼지만 그리퍼가 25cm 이상 물러나지 않음) 또는 (1)의 수평거리 초과.
+# 아래 진단은 매 스텝 두 조건의 수치/충족여부를 계산해, 에피소드 종료 시 사람이
+# 읽을 수 있는 근거(어느 조건이 미충족인지)로 로그에 남긴다.
+#
+# task별 container 객체명·임계값이 다르므로 표로 관리한다. 표에 없는 task는
+# container th=None(=robocasa 기본 recep.horizontal_radius*0.7)으로 추정한다.
+#   task_name -> (container 객체명, container th[m] 또는 None, gripper-far th[m])
+_SUCCESS_SPEC = {
+    "PickPlaceCounterToStove": ("container", 0.07, 0.25),
+}
+_DEFAULT_GRIPPER_FAR_TH = 0.25
+
+
 class RoboCasaEnv:
     """EXPO-FT 클라이언트 인터페이스를 노출하는 gym 형태의 RoboCasa365 환경.
 
@@ -104,6 +123,9 @@ class RoboCasaEnv:
         camera_height=256,
         max_steps=400,
         language_instruction=None,
+        # 고정 주방 핀: 둘 다 지정되면 그 (layout, style)로 주방을 고정한다(객체는 무작위 유지).
+        fixed_layout_id=None,
+        fixed_style_id=None,
         **kwargs,
     ):
         self.video_dir = video_dir or ""
@@ -126,6 +148,25 @@ class RoboCasaEnv:
             enable_render=True,
         )
 
+        # 주방(layout/style)만 단일 장면으로 고정. split="pretrain"은 매 reset마다
+        # layout/style를 11~60 풀에서 무작위로 뽑지만(kitchen._setup_model의
+        # rng.choice(self.layout_and_style_ids), kitchen.py:595), 후보 리스트를 단일
+        # (L,S) 한 쌍으로 줄이면 그 draw가 항상 같은 주방을 반환한다(=주방 고정).
+        # 객체 정체성·배치·언어 지시문은 별도 rng draw라 그대로 매 에피소드 무작위로 유지된다
+        # (단, 학습 reset에 고정 seed를 주면 안 됨 — 주면 rng가 재시드돼 객체까지 고정됨).
+        # 둘 다 지정된 경우에만 적용. 생성자에서만 도는 EXCLUDE 필터는 이 사후 대입을
+        # 재검증하지 않으므로 pretrain 풀(11~60) 내 유효 쌍만 쓸 것(예: (11,14)).
+        # 생성 시점 RoboCasaGymEnv가 이미 한 번 reset(미고정 풀)했지만, 첫 실제
+        # 에피소드의 RoboCasaEnv.reset()이 고정된 리스트로 다시 reset하므로 무해하다.
+        if fixed_layout_id is not None and fixed_style_id is not None:
+            self.gym.env.layout_and_style_ids = [
+                (int(fixed_layout_id), int(fixed_style_id))
+            ]
+            logger.info(
+                "Pinned kitchen to (layout=%d, style=%d); objects/placement/lang remain random",
+                int(fixed_layout_id), int(fixed_style_id),
+            )
+
         self._last_obs = None
         self._done = False
         self._success = False
@@ -136,7 +177,139 @@ class RoboCasaEnv:
         self._frame_buffer = []
         self._ep_count = 0
 
+        # 성공 판정 진단용 누적 트래커(reset마다 초기화). _last_diag는 마지막 스텝의
+        # 하위조건 측정값, _ever_*는 에피소드 동안 한 번이라도 충족됐는지.
+        self._last_diag = None
+        self._ever_in_recep = False
+        self._ever_gripper_far = False
+
     # -------------------------------------------------------------------- 헬퍼
+    def _diagnose_components(self):
+        """현재 sim 상태에서 성공 판정 하위 조건을 계산해 dict로 반환.
+
+        반환 dict 키(측정 실패 시 해당 값은 None):
+          obj_in_recep : (충족여부, contact, 수평거리, th, recep명)
+          gripper_far  : (충족여부, 그리퍼-obj거리, th)
+        _check_success()는 재호출하지 않는다(gym_wrapper가 같은 상태에서 이미
+        계산했고 그 결과가 self._success). 어떤 예외도 롤아웃을 깨뜨리지 않도록
+        전부 try/except로 감싼다.
+        """
+        env = self.gym.env
+        spec = _SUCCESS_SPEC.get(self.task_name)
+        recep_name, recep_th, far_th = (
+            spec if spec else ("container", None, _DEFAULT_GRIPPER_FAR_TH)
+        )
+        comp = {"obj_in_recep": None, "gripper_far": None, "recep": recep_name, "far_th": far_th}
+
+        # (1) obj가 container에 담겼는가: 접촉 AND 수평중심거리 < th
+        try:
+            from robocasa.utils import object_utils as OU  # noqa: F401 (참고: 기준 구현)
+
+            obj_pos = np.asarray(env.sim.data.body_xpos[env.obj_body_id["obj"]])
+            recep_pos = np.asarray(env.sim.data.body_xpos[env.obj_body_id[recep_name]])
+            th = (
+                recep_th
+                if recep_th is not None
+                else float(env.objects[recep_name].horizontal_radius * 0.7)
+            )
+            horiz = float(np.linalg.norm(obj_pos[:2] - recep_pos[:2]))
+            contact = bool(env.check_contact(env.objects["obj"], env.objects[recep_name]))
+            comp["obj_in_recep"] = (bool(contact and horiz < th), contact, horiz, float(th), recep_name)
+        except Exception as e:  # task에 obj/container가 없거나 키가 다를 수 있음
+            logger.debug("obj_in_recep 진단 실패: %s", e)
+
+        # (2) 그리퍼가 obj에서 멀어졌는가: 거리 > far_th
+        try:
+            obj_pos = np.asarray(env.sim.data.body_xpos[env.obj_body_id["obj"]])
+            grip_pos = np.asarray(env.sim.data.site_xpos[env.robots[0].eef_site_id["right"]])
+            d = float(np.linalg.norm(grip_pos - obj_pos))
+            comp["gripper_far"] = (bool(d > far_th), d, float(far_th))
+        except Exception as e:
+            logger.debug("gripper_far 진단 실패: %s", e)
+
+        return comp
+
+    def _log_episode_outcome(self):
+        """에피소드 종료 시 성공/실패 판정 근거를 사람이 읽을 수 있게 로그로 남긴다."""
+        comp = self._last_diag or {}
+        oir = comp.get("obj_in_recep")
+        gf = comp.get("gripper_far")
+        recep = comp.get("recep", "container")
+
+        sep = "=" * 72
+        result = "SUCCESS" if self._success else "FAILURE"
+        lines = [
+            "",  # 이전 에피소드 로그와 시각적으로 분리
+            sep,
+            "[EP %06d] Episode done: %s  steps=%d/%d"
+            % (self._ep_count, result, self._steps, self.max_steps),
+            sep,
+        ]
+        # 판정기준(성공 조건) 명시
+        far_th = comp.get("far_th", _DEFAULT_GRIPPER_FAR_TH)
+        recep_th_txt = f"{oir[3]:.3f}m" if oir else "?"
+        lines.append(
+            "  판정기준[%s]: obj가 %s에 담김(접촉 AND 수평중심거리<%s) AND 그리퍼-obj거리>%.3fm"
+            % (self.task_name, recep, recep_th_txt, far_th)
+        )
+
+        blockers = []  # 실패의 직접 원인이 된 미충족 조건들
+        # (1) obj-in-receptacle 결과
+        if oir is not None:
+            ok, contact, horiz, th, rname = oir
+            lines.append(
+                "  - obj-in-%s : %s (contact=%s, 수평거리=%.3fm %s %.3fm)%s"
+                % (
+                    rname,
+                    "PASS" if ok else "FAIL",
+                    contact,
+                    horiz,
+                    "<" if horiz < th else ">=",
+                    th,
+                    "" if ok else "  ← 미충족",
+                )
+            )
+            if not ok:
+                if not contact:
+                    blockers.append(f"{rname} 미접촉(물체가 {rname}에 직접 닿지 않음)")
+                elif horiz >= th:
+                    blockers.append(f"수평거리 {horiz:.3f}m가 임계 {th:.3f}m 초과")
+        # (2) gripper-far 결과
+        if gf is not None:
+            ok, d, th = gf
+            lines.append(
+                "  - gripper-far : %s (그리퍼-obj거리=%.3fm %s %.3fm)%s"
+                % (
+                    "PASS" if ok else "FAIL",
+                    d,
+                    ">" if d > th else "<=",
+                    th,
+                    "" if ok else "  ← 미충족",
+                )
+            )
+            if not ok:
+                blockers.append(f"그리퍼가 obj에서 {d:.3f}m밖에 안 떨어짐(필요>{th:.3f}m)")
+
+        # 실패라면 원인/힌트 요약
+        if not self._success:
+            if blockers:
+                lines.append("  원인: " + " ; ".join(blockers))
+            # "영상상 성공" 전형 패턴: 물체는 담겼는데 그리퍼만 안 물러남
+            if oir is not None and oir[0] and gf is not None and not gf[0]:
+                lines.append(
+                    "  └ 물체는 %s에 담겼으나 그리퍼가 충분히 물러나지 않음 — 영상상 성공처럼 보여도 자동판정은 실패."
+                    % recep
+                )
+            # 에피소드 도중 두 조건이 (다른 시점에라도) 각각 충족된 적이 있는지
+            lines.append(
+                "  에피소드 중 도달여부: obj-in-%s=%s, gripper-far=%s"
+                % (recep, self._ever_in_recep, self._ever_gripper_far)
+            )
+
+        lines.append(sep)
+        logger.info("\n".join(lines))
+
+    # ------------------------------------------------------------ 추가 내부 헬퍼
     def _translate_obs(self, raw):
         """RoboCasaGymEnv obs -> 서버가 읽는 observation/* 규약으로 매핑."""
         state = np.concatenate(
@@ -168,7 +341,10 @@ class RoboCasaEnv:
         path = os.path.join(self.video_dir, f"train_ep{self._ep_count:06d}.mp4")
         try:
             imageio.mimwrite(path, self._frame_buffer, fps=20, quality=8)
-            logger.info("Saved episode video: %s (%d frames)", path, len(self._frame_buffer))
+            logger.info(
+                "[EP %06d] Saved episode video: %s (%d frames)",
+                self._ep_count, path, len(self._frame_buffer),
+            )
         except Exception as e:  # 영상 IO가 롤아웃을 깨뜨리지 않게 한다
             logger.warning("Failed to save episode video (%s)", e)
         self._frame_buffer = []
@@ -186,6 +362,10 @@ class RoboCasaEnv:
         self._success = False
         self._reward = 0.0
         self._frame_buffer = []
+        # 진단 트래커 초기화
+        self._last_diag = None
+        self._ever_in_recep = False
+        self._ever_gripper_far = False
         self._last_obs = self._translate_obs(raw)
         self._maybe_record()
         return self._last_obs
@@ -228,13 +408,17 @@ class RoboCasaEnv:
         # create_env에서 ignore_done=True => done은 success / max_steps로 판정.
         self._done = bool(self._success or done or self._steps >= self.max_steps)
 
+        # 성공 판정 하위조건을 같은 sim 상태에서 측정해 누적(영상상 성공/실제 실패 진단용).
+        self._last_diag = self._diagnose_components()
+        if self._last_diag.get("obj_in_recep") is not None:
+            self._ever_in_recep |= self._last_diag["obj_in_recep"][0]
+        if self._last_diag.get("gripper_far") is not None:
+            self._ever_gripper_far |= self._last_diag["gripper_far"][0]
+
         self._last_obs = self._translate_obs(raw)
         self._maybe_record()
         if self._done:
-            logger.info(
-                "Episode done: success=%s steps=%d/%d",
-                self._success, self._steps, self.max_steps,
-            )
+            self._log_episode_outcome()
             self._save_video()
         return {"executed_action": arm}
 

@@ -40,6 +40,19 @@ def get_config():
 
     config.split = "pretrain"
 
+    # ── 고정 주방(kitchen) 핀 ─────────────────────────────────────────────
+    # split="pretrain"은 매 reset마다 layout/style를 11~60 풀에서 무작위로 뽑는다.
+    # 아래 두 값이 둘 다 지정되면(클라이언트에서 주입) 그 (layout, style) 한 장면으로
+    # 주방을 고정한다. 대상 객체 정체성·배치·언어 지시문은 여전히 에피소드마다 무작위
+    # (객체/배치는 별도 rng draw라 주방 고정과 독립적). 둘 중 하나라도 None이면 비활성.
+    #
+    # ⚠️ env는 '클라이언트'만 생성하므로(run_client.py가 이 파일을 직접 다시 읽음),
+    #   서버측 --config_task.* 오버라이드로는 이 값이 env에 도달하지 못한다. 실제 활성화는
+    #   run_client.py의 --fixed_layout_id/--fixed_style_id (scripts/sim/run_policy.sh)로 한다.
+    #   기본 None = 무작위 주방(기존 동작). 값은 pretrain 풀(11~60) 내 유효 쌍만 쓸 것.
+    config.fixed_layout_id = ml_collections.config_dict.placeholder(int)
+    config.fixed_style_id = ml_collections.config_dict.placeholder(int)
+
     config.camera_width = 256
     config.camera_height = 256
 
